@@ -47,21 +47,34 @@ def extract_json_from_model_output(content: str) -> dict:
 		assert isinstance(result_dict, dict), f'Expected JSON dictionary in response, got JSON {type(result_dict)} instead'
 		return result_dict
 	except json.JSONDecodeError as e:
-		# Try to fix Gemini's triple-escaped quotes before giving up
+		# Try to fix Gemini's escaped quotes before giving up
 		try:
-			# Handle triple-escaped quotes (\\\\\\') -> single quotes (')
-			fixed_content = content.replace("\\\\\\'", "'")
+			# Make a copy to work with
+			fixed_content = content
 			
-			# Also handle double-escaped quotes (\\\\") -> double quotes (")
-			fixed_content = fixed_content.replace('\\\\"', '"')
-			
-			# If content is wrapped in code blocks, extract just the JSON part
+			# If content is wrapped in code blocks, extract just the JSON part first
 			if '```' in fixed_content:
 				# Find the JSON content between code blocks
-				fixed_content = fixed_content.split('```')[1]
+				parts = fixed_content.split('```')
+				if len(parts) >= 3:
+					fixed_content = parts[1]
 				# Remove language identifier if present (e.g., 'json\n')
 				if '\n' in fixed_content:
 					fixed_content = fixed_content.split('\n', 1)[1]
+			
+			# Handle various levels of escaped quotes
+			# Triple-escaped quotes (\\\') -> single quotes (')
+			fixed_content = fixed_content.replace("\\\\'", "'")
+			# Also handle the raw string version
+			fixed_content = fixed_content.replace(r"\'", "'")
+			
+			# Double-escaped quotes (\\") -> double quotes (")
+			fixed_content = fixed_content.replace('\\\\"', '"')
+			fixed_content = fixed_content.replace(r'\"', '"')
+			
+			# Sometimes Gemini uses backslash before single quotes in contractions
+			# This is a more targeted fix for specific patterns
+			fixed_content = re.sub(r"(\w)\\'(\w)", r"\1'\2", fixed_content)
 			
 			result_dict = json.loads(fixed_content)
 			
@@ -70,11 +83,13 @@ def extract_json_from_model_output(content: str) -> dict:
 				result_dict = result_dict[0]
 			
 			assert isinstance(result_dict, dict), f'Expected JSON dictionary in response, got JSON {type(result_dict)} instead'
-			logger.info('Successfully parsed JSON after fixing escaped quotes')
+			logger.debug('Successfully parsed JSON after fixing escaped quotes')
 			return result_dict
-		except Exception:
+		except Exception as fix_error:
 			# If all fixes fail, show the original error
-			logger.warning(f'Failed to parse model output: {content} {str(e)}')
+			logger.warning(f'Failed to parse model output: {content}')
+			logger.warning(f'Original error: {str(e)}')
+			logger.warning(f'Fix attempt error: {str(fix_error)}')
 			raise ValueError('Could not parse response.')
 
 
