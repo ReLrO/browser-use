@@ -245,6 +245,20 @@ class Agent(Generic[Context]):
 				'⚠️ XAI models do not support use_vision=True yet. Setting use_vision_for_planner=False for now...'
 			)
 			self.settings.use_vision_for_planner = False
+			
+		# Handle Gemini models - they need special settings for better compatibility
+		if 'gemini' in self.model_name.lower() or self.chat_model_library == 'ChatGoogleGenerativeAI':
+			self.logger.info('🔧 Applying Gemini-specific settings for better compatibility...')
+			# Increase max_failures for Gemini due to occasional JSON parsing issues
+			if max_failures == 3:  # Only override if using default
+				self.settings.max_failures = 10
+				self.logger.info('  - Increased max_failures to 10 for Gemini')
+			# Add JSON formatting instructions to system message
+			gemini_json_help = "\n\nIMPORTANT: Use single quotes (') instead of double quotes (\") in text descriptions to avoid JSON escaping issues."
+			if extend_system_message:
+				self.settings.extend_system_message = extend_system_message + gemini_json_help
+			else:
+				self.settings.extend_system_message = gemini_json_help
 
 		self.logger.info(
 			f'🧠 Starting a browser-use agent {self.version} with base_model={self.model_name}'
@@ -687,7 +701,8 @@ class Agent(Generic[Context]):
 
 		# Google models
 		elif self.chat_model_library == 'ChatGoogleGenerativeAI':
-			return None  # Google uses native tool support
+			# Force 'raw' mode for Gemini to avoid "unknown()" action issues
+			return 'raw'
 
 		# Anthropic models
 		elif self.chat_model_library in ['ChatAnthropic', 'AnthropicChat']:

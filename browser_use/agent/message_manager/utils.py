@@ -47,8 +47,35 @@ def extract_json_from_model_output(content: str) -> dict:
 		assert isinstance(result_dict, dict), f'Expected JSON dictionary in response, got JSON {type(result_dict)} instead'
 		return result_dict
 	except json.JSONDecodeError as e:
-		logger.warning(f'Failed to parse model output: {content} {str(e)}')
-		raise ValueError('Could not parse response.')
+		# Try to fix Gemini's triple-escaped quotes before giving up
+		try:
+			# Handle triple-escaped quotes (\\\\\\') -> single quotes (')
+			fixed_content = content.replace("\\\\\\'", "'")
+			
+			# Also handle double-escaped quotes (\\\\") -> double quotes (")
+			fixed_content = fixed_content.replace('\\\\"', '"')
+			
+			# If content is wrapped in code blocks, extract just the JSON part
+			if '```' in fixed_content:
+				# Find the JSON content between code blocks
+				fixed_content = fixed_content.split('```')[1]
+				# Remove language identifier if present (e.g., 'json\n')
+				if '\n' in fixed_content:
+					fixed_content = fixed_content.split('\n', 1)[1]
+			
+			result_dict = json.loads(fixed_content)
+			
+			# Handle list containing one dict
+			if isinstance(result_dict, list) and len(result_dict) == 1 and isinstance(result_dict[0], dict):
+				result_dict = result_dict[0]
+			
+			assert isinstance(result_dict, dict), f'Expected JSON dictionary in response, got JSON {type(result_dict)} instead'
+			logger.info('Successfully parsed JSON after fixing escaped quotes')
+			return result_dict
+		except Exception:
+			# If all fixes fail, show the original error
+			logger.warning(f'Failed to parse model output: {content} {str(e)}')
+			raise ValueError('Could not parse response.')
 
 
 def convert_input_messages(input_messages: list[BaseMessage], model_name: str | None) -> list[BaseMessage]:

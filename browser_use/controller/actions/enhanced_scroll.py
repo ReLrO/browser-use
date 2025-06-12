@@ -13,8 +13,7 @@ from pydantic import BaseModel, Field
 from playwright.async_api import Page
 
 from browser_use.browser import BrowserSession
-from browser_use.controller.service import Controller
-from browser_use.controller.views import ActionResult
+from browser_use.controller.service import Controller, ActionResult
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +77,14 @@ class InfiniteScrollAction(BaseModel):
     item_selector: Optional[str] = Field(default=None, description="CSS selector to count loaded items")
 
 
+class SmartScrollToFindAction(BaseModel):
+    """Parameters for smart scrolling to find content"""
+    text: str = Field(description="Text content to search for")
+    container_selector: Optional[str] = Field(default=None, description="Container to scroll (default: auto-detect)")
+    max_scrolls_per_direction: int = Field(default=5, description="Max scrolls in each direction")
+    scroll_amount: int = Field(default=400, description="Pixels to scroll each attempt")
+
+
 def register_enhanced_scroll_actions(controller: Controller) -> None:
     """Register all enhanced scrolling actions with the controller"""
     
@@ -86,8 +93,7 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
         param_model=EnhancedScrollAction
     )
     async def enhanced_scroll(params: EnhancedScrollAction, browser_session: BrowserSession) -> ActionResult:
-        """
-        Enhanced scrolling with support for:
+        """Enhanced scrolling with support for:
         - Multiple directions (up, down, left, right)
         - Different strategies (pixels, viewport percentage, full page, to end)
         - Specific container targeting
@@ -126,34 +132,43 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             async (options) => {
                 const { direction, amount, strategy, targetSelector, smooth } = options;
                 
-                // Find the scrollable container
                 let container = null;
                 
                 if (targetSelector) {
                     container = document.querySelector(targetSelector);
                     if (!container) {
-                        throw new Error(`Container not found: ${targetSelector}`);
+                        throw new Error('Container not found: ' + targetSelector);
                     }
                 } else {
-                    // Smart container detection
+                    const isFilterPanel = el => 
+                        el.tagName === 'FORM' || 
+                        el.classList.contains('overflow-y-auto') ||
+                        el.classList.contains('scaffold-layout__aside') ||
+                        el.querySelector('[aria-label*="filter"]');
+                    
+                    const isMainContent = el =>
+                        el.id === 'search-results-container' ||
+                        el.classList.contains('search-results') ||
+                        el.classList.contains('main-content') ||
+                        el.querySelector('[data-test*="search-result"]');
+                    
                     const bigEnough = el => el.clientHeight >= window.innerHeight * 0.5;
                     const canScroll = el =>
                         el &&
                         /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) &&
-                        el.scrollHeight > el.clientHeight &&
-                        bigEnough(el);
+                        el.scrollHeight > el.clientHeight;
                     
-                    let el = document.activeElement;
-                    while (el && !canScroll(el) && el !== document.body) el = el.parentElement;
+                    let mainContent = [...document.querySelectorAll('*')].find(el => 
+                        isMainContent(el) && canScroll(el) && bigEnough(el)
+                    );
                     
-                    container = canScroll(el)
-                        ? el
-                        : [...document.querySelectorAll('*')].find(canScroll)
-                        || document.scrollingElement
-                        || document.documentElement;
+                    if (mainContent) {
+                        container = mainContent;
+                    } else {
+                        container = document.scrollingElement || document.documentElement;
+                    }
                 }
                 
-                // Calculate scroll values
                 let scrollX = 0, scrollY = 0;
                 
                 if (strategy === 'to_end') {
@@ -173,7 +188,6 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     else if (direction === 'left') scrollX = amount;
                 }
                 
-                // Perform scroll
                 const isRoot = container === document.scrollingElement || 
                               container === document.documentElement || 
                               container === document.body;
@@ -190,7 +204,16 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     container.scrollBy(scrollOptions);
                 }
                 
-                // Return scroll info
+                const maxScrollY = container.scrollHeight - container.clientHeight;
+                const maxScrollX = container.scrollWidth - container.clientWidth;
+                const scrollPercentY = maxScrollY > 0 ? (container.scrollTop / maxScrollY) * 100 : 0;
+                const scrollPercentX = maxScrollX > 0 ? (container.scrollLeft / maxScrollX) * 100 : 0;
+                
+                let position = '';
+                if (scrollPercentY <= 5) position = 'top';
+                else if (scrollPercentY >= 95) position = 'bottom';
+                else position = 'middle';
+                
                 return {
                     container: targetSelector || (isRoot ? 'window' : container.className || container.tagName),
                     scrolledX: scrollX,
@@ -198,6 +221,11 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     newPosition: {
                         x: isRoot ? window.scrollX : container.scrollLeft,
                         y: isRoot ? window.scrollY : container.scrollTop
+                    },
+                    scrollPosition: {
+                        percentY: scrollPercentY,
+                        percentX: scrollPercentX,
+                        position: position
                     },
                     hasMoreContent: {
                         down: container.scrollTop < (container.scrollHeight - container.clientHeight - 5),
@@ -229,16 +257,20 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             if params.strategy == ScrollStrategy.TO_END:
                 msg = f"🔍 Scrolled to the {params.direction.value}{target_str}"
             
-            # Add info about remaining content
+            # Add position and content info
+            position_info = result.get('scrollPosition', {})
+            if position_info.get('position'):
+                msg += f" - now at {position_info['position']} ({position_info['percentY']:.0f}%)"
+            
             more_content = []
             for direction, has_more in result['hasMoreContent'].items():
                 if has_more:
                     more_content.append(direction)
             
             if more_content:
-                msg += f" (more content available: {', '.join(more_content)})"
+                msg += f" (can scroll: {', '.join(more_content)})"
             else:
-                msg += " (reached limit)"
+                msg += " (reached scroll limits)"
             
             logger.info(msg)
             return ActionResult(
@@ -267,50 +299,47 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             () => {
                 const scrollableElements = [];
                 
-                // Helper function to check if element is scrollable
                 function isScrollable(element) {
                     const style = window.getComputedStyle(element);
                     const overflowY = style.overflowY;
                     const overflowX = style.overflowX;
                     const overflow = style.overflow;
                     
-                    // Check if overflow allows scrolling
                     const hasScrollableOverflow = 
                         /(auto|scroll|overlay)/.test(overflowY) ||
                         /(auto|scroll|overlay)/.test(overflowX) ||
                         /(auto|scroll|overlay)/.test(overflow);
                     
-                    // Check if element has content to scroll
                     const canScrollVertically = element.scrollHeight > element.clientHeight;
                     const canScrollHorizontally = element.scrollWidth > element.clientWidth;
                     
                     return hasScrollableOverflow && (canScrollVertically || canScrollHorizontally);
                 }
                 
-                // Helper to get element description
                 function getElementDescription(element) {
                     let desc = element.tagName.toLowerCase();
-                    if (element.id) desc += `#${element.id}`;
+                    if (element.id) desc += '#' + element.id;
                     if (element.className) {
                         const classes = element.className.toString().split(' ').filter(c => c).slice(0, 3);
-                        if (classes.length) desc += `.${classes.join('.')}`;
+                        if (classes.length) desc += '.' + classes.join('.');
                     }
                     
-                    // Check for ARIA labels
                     const ariaLabel = element.getAttribute('aria-label');
-                    if (ariaLabel) desc += ` [${ariaLabel}]`;
+                    if (ariaLabel) desc += ' [' + ariaLabel + ']';
                     
-                    // Check if it's a known pattern
-                    if (element.classList.contains('scaffold-layout__aside')) {
-                        desc += ' (LinkedIn Filter Panel)';
+                    if (element.classList.contains('scaffold-layout__aside') || 
+                        element.tagName === 'FORM' && element.classList.contains('overflow-y-auto')) {
+                        desc += ' (Filter Panel)';
                     } else if (element.classList.contains('artdeco-typeahead__results-list')) {
-                        desc += ' (LinkedIn Dropdown)';
+                        desc += ' (Dropdown)';
+                    } else if (element.id === 'search-results-container' || 
+                               element.classList.contains('search-results')) {
+                        desc += ' (Search Results)';
                     }
                     
                     return desc;
                 }
                 
-                // Find all scrollable elements
                 const allElements = document.querySelectorAll('*');
                 for (const element of allElements) {
                     if (isScrollable(element)) {
@@ -319,11 +348,20 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                                         rect.top < window.innerHeight && 
                                         rect.bottom > 0;
                         
+                        const maxScroll = element.scrollHeight - element.clientHeight;
+                        const scrollPercent = maxScroll > 0 ? (element.scrollTop / maxScroll) * 100 : 0;
+                        let position = '';
+                        if (scrollPercent <= 5) position = 'top';
+                        else if (scrollPercent >= 95) position = 'bottom';
+                        else position = 'middle';
+                        
+                        const elementSelector = element.tagName.toLowerCase() + 
+                                               (element.id ? '#' + element.id : '') + 
+                                               (element.className ? '.' + element.className.toString().split(' ')[0] : '');
+                        
                         scrollableElements.push({
                             description: getElementDescription(element),
-                            selector: element.tagName.toLowerCase() + 
-                                     (element.id ? `#${element.id}` : '') +
-                                     (element.className ? `.${element.className.toString().split(' ')[0]}` : ''),
+                            selector: elementSelector,
                             dimensions: {
                                 width: rect.width,
                                 height: rect.height,
@@ -334,9 +372,11 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                                 scrollHeight: element.scrollHeight,
                                 clientHeight: element.clientHeight,
                                 scrollTop: element.scrollTop,
-                                canScrollDown: element.scrollTop < (element.scrollHeight - element.clientHeight),
-                                canScrollUp: element.scrollTop > 0,
-                                scrollablePixels: element.scrollHeight - element.clientHeight
+                                canScrollDown: element.scrollTop < (element.scrollHeight - element.clientHeight - 5),
+                                canScrollUp: element.scrollTop > 5,
+                                scrollablePixels: element.scrollHeight - element.clientHeight,
+                                scrollPercent: scrollPercent,
+                                position: position
                             },
                             isVisible: isVisible,
                             isFilterPanel: element.classList.contains('scaffold-layout__aside') ||
@@ -347,7 +387,6 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     }
                 }
                 
-                // Sort by relevance (visible first, then by size)
                 scrollableElements.sort((a, b) => {
                     if (a.isVisible !== b.isVisible) return b.isVisible ? 1 : -1;
                     return (b.dimensions.width * b.dimensions.height) - (a.dimensions.width * a.dimensions.height);
@@ -382,12 +421,18 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             for i, elem in enumerate(result['elements'][:5]):  # Top 5
                 if elem['isVisible']:
                     scroll_status = []
-                    if elem['scrollInfo']['canScrollDown']:
-                        scroll_status.append("can scroll down")
-                    if elem['scrollInfo']['canScrollUp']:
-                        scroll_status.append("can scroll up")
+                    scroll_info = elem['scrollInfo']
                     
-                    msg_parts.append(f"\n{i+1}. {elem['description']} - {', '.join(scroll_status) if scroll_status else 'at limits'}")
+                    # Include position info
+                    pos_str = f"at {scroll_info['position']} ({scroll_info['scrollPercent']:.0f}%)"
+                    
+                    if scroll_info['canScrollDown']:
+                        scroll_status.append("↓ down")
+                    if scroll_info['canScrollUp']:
+                        scroll_status.append("↑ up")
+                    
+                    status = f"{pos_str}, can scroll: {', '.join(scroll_status)}" if scroll_status else f"{pos_str} (at limits)"
+                    msg_parts.append(f"\n{i+1}. {elem['description']} - {status}")
             
             msg = "\n".join(msg_parts)
             logger.info(msg)
@@ -417,22 +462,19 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                 const element = document.querySelector(selector);
                 
                 if (!element) {
-                    throw new Error(`Element not found: ${selector}`);
+                    throw new Error('Element not found: ' + selector);
                 }
                 
-                // Get element info before scroll
                 const beforeRect = element.getBoundingClientRect();
                 const wasVisible = beforeRect.top >= 0 && 
                                   beforeRect.bottom <= window.innerHeight;
                 
-                // Perform scroll
                 element.scrollIntoView({
                     behavior: smooth ? 'smooth' : 'auto',
                     block: alignment,
                     inline: 'nearest'
                 });
                 
-                // Get element info after scroll (with delay for smooth scroll)
                 return new Promise(resolve => {
                     setTimeout(() => {
                         const afterRect = element.getBoundingClientRect();
@@ -490,15 +532,13 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             async (options) => {
                 const { text, maxScrolls, scrollAmount, containerSelector } = options;
                 
-                // Find scrollable container
                 let container = null;
                 if (containerSelector) {
                     container = document.querySelector(containerSelector);
                     if (!container) {
-                        throw new Error(`Container not found: ${containerSelector}`);
+                        throw new Error('Container not found: ' + containerSelector);
                     }
                 } else {
-                    // Use smart detection
                     const bigEnough = el => el.clientHeight >= window.innerHeight * 0.5;
                     const canScroll = el =>
                         el &&
@@ -542,16 +582,14 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     return false;
                 };
                 
-                // Initial check
                 if (searchForText()) {
                     return {
                         found: true,
                         scrollCount: 0,
-                        message: `Text '${text}' is already visible`
+                        message: 'Text "' + text + '" is already visible'
                     };
                 }
                 
-                // Scroll and search
                 while (scrollCount < maxScrolls && !found) {
                     const oldScrollTop = isRoot ? window.scrollY : container.scrollTop;
                     
@@ -561,7 +599,6 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                         container.scrollBy(0, scrollAmount);
                     }
                     
-                    // Wait for content to load
                     await new Promise(r => setTimeout(r, 300));
                     
                     scrollCount++;
@@ -571,7 +608,6 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                         break;
                     }
                     
-                    // Check if we've reached the bottom
                     const newScrollTop = isRoot ? window.scrollY : container.scrollTop;
                     if (newScrollTop === oldScrollTop) {
                         break;
@@ -582,8 +618,8 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                     found: found,
                     scrollCount: scrollCount,
                     message: found ? 
-                        `Found '${text}' after ${scrollCount} scrolls` : 
-                        `Text '${text}' not found after ${scrollCount} scrolls`
+                        'Found "' + text + '" after ' + scrollCount + ' scrolls' : 
+                        'Text "' + text + '" not found after ' + scrollCount + ' scrolls'
                 };
             }
             """
@@ -687,5 +723,196 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             
         except Exception as e:
             error_msg = f"Failed to handle infinite scroll: {str(e)}"
+            logger.error(error_msg)
+            return ActionResult(error=error_msg, include_in_memory=True)
+    
+    @controller.action(
+        description="Smart scroll that automatically tries both directions to find content",
+        param_model=SmartScrollToFindAction
+    )
+    async def smart_scroll_to_find(params: SmartScrollToFindAction, browser_session: BrowserSession) -> ActionResult:
+        """
+        Intelligently scroll to find content by:
+        1. Checking current scroll position
+        2. If at bottom, try scrolling up first
+        3. If at top, try scrolling down first
+        4. If in middle, try both directions
+        """
+        page = await browser_session.get_current_page()
+        
+        try:
+            js_code = """
+            async (options) => {
+                const { text, containerSelector, maxScrollsPerDirection, scrollAmount } = options;
+                
+                let container = null;
+                if (containerSelector) {
+                    container = document.querySelector(containerSelector);
+                    if (!container) {
+                        throw new Error('Container not found: ' + containerSelector);
+                    }
+                } else {
+                    const bigEnough = el => el.clientHeight >= window.innerHeight * 0.5;
+                    const canScroll = el =>
+                        el &&
+                        /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) &&
+                        el.scrollHeight > el.clientHeight &&
+                        bigEnough(el);
+                    
+                    container = [...document.querySelectorAll('*')].find(canScroll)
+                        || document.scrollingElement
+                        || document.documentElement;
+                }
+                
+                const isRoot = container === document.scrollingElement || 
+                              container === document.documentElement || 
+                              container === document.body;
+                
+                const searchForText = () => {
+                    const walker = document.createTreeWalker(
+                        container || document.body,
+                        NodeFilter.SHOW_TEXT,
+                        null,
+                        false
+                    );
+                    
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const nodeText = node.nodeValue.trim();
+                        if (nodeText && nodeText.toLowerCase().includes(text.toLowerCase())) {
+                            const element = node.parentElement;
+                            if (element) {
+                                const rect = element.getBoundingClientRect();
+                                if (rect.width > 0 && rect.height > 0 && 
+                                    rect.top >= -10 && rect.bottom <= window.innerHeight + 10 &&
+                                    rect.left >= -10 && rect.right <= window.innerWidth + 10) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    
+                    const elements = (container || document).querySelectorAll('button, a, [aria-label], [role="button"]');
+                    for (const el of elements) {
+                        const elementText = (el.textContent || '').trim();
+                        const ariaLabel = el.getAttribute('aria-label') || '';
+                        const combinedText = elementText + ' ' + ariaLabel;
+                        
+                        if (combinedText.toLowerCase().includes(text.toLowerCase())) {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 && 
+                                rect.top >= -10 && rect.bottom <= window.innerHeight + 10 &&
+                                rect.left >= -10 && rect.right <= window.innerWidth + 10) {
+                                return true;
+                            }
+                        }
+                    }
+                    
+                    return false;
+                };
+                
+                if (searchForText()) {
+                    return {
+                        found: true,
+                        direction: 'none',
+                        scrollCount: 0,
+                        message: 'Text "' + text + '" is already visible'
+                    };
+                }
+                
+                const scrollTop = isRoot ? window.scrollY : container.scrollTop;
+                const maxScroll = container.scrollHeight - container.clientHeight;
+                const scrollPercent = maxScroll > 0 ? (scrollTop / maxScroll) * 100 : 0;
+                
+                let directions = [];
+                if (scrollPercent >= 90) {
+                    directions = ['up', 'down'];
+                } else if (scrollPercent <= 10) {
+                    directions = ['down', 'up'];
+                } else {
+                    directions = ['down', 'up'];
+                }
+                
+                const results = {
+                    found: false,
+                    direction: 'none',
+                    scrollCount: 0,
+                    triedDirections: [],
+                    initialPosition: scrollPercent
+                };
+                
+                for (const direction of directions) {
+                    results.triedDirections.push(direction);
+                    
+                    if (results.triedDirections.length > 1) {
+                        if (isRoot) {
+                            window.scrollTo(0, scrollTop);
+                        } else {
+                            container.scrollTop = scrollTop;
+                        }
+                        await new Promise(r => setTimeout(r, 100));
+                    }
+                    
+                    const scrollStep = direction === 'up' ? -scrollAmount : scrollAmount;
+                    let scrollsInDirection = 0;
+                    
+                    while (scrollsInDirection < maxScrollsPerDirection) {
+                        const oldScroll = isRoot ? window.scrollY : container.scrollTop;
+                        
+                        if (isRoot) {
+                            window.scrollBy(0, scrollStep);
+                        } else {
+                            container.scrollBy(0, scrollStep);
+                        }
+                        
+                        await new Promise(r => setTimeout(r, 300));
+                        scrollsInDirection++;
+                        results.scrollCount++;
+                        
+                        if (searchForText()) {
+                            results.found = true;
+                            results.direction = direction;
+                            return results;
+                        }
+                        
+                        const newScroll = isRoot ? window.scrollY : container.scrollTop;
+                        if ((direction === 'up' && newScroll <= 5) || 
+                            (direction === 'down' && newScroll >= maxScroll - 5)) {
+                            break;
+                        }
+                    }
+                }
+                
+                return results;
+            }
+            """
+            
+            options = {
+                "text": params.text,
+                "containerSelector": params.container_selector,
+                "maxScrollsPerDirection": params.max_scrolls_per_direction,
+                "scrollAmount": params.scroll_amount
+            }
+            
+            result = await page.evaluate(js_code, options)
+            
+            if result['found']:
+                msg = f"🎯 Found '{params.text}' by scrolling {result['direction']} ({result['scrollCount']} scrolls)"
+            else:
+                tried = ", ".join(result['triedDirections'])
+                msg = f"❌ Could not find '{params.text}' after trying directions: {tried} ({result['scrollCount']} total scrolls)"
+            
+            if result.get('initialPosition') is not None:
+                msg += f" - started at {result['initialPosition']:.0f}% scroll position"
+            
+            logger.info(msg)
+            return ActionResult(
+                data=result,
+                extracted_content=msg,
+                include_in_memory=True
+            )
+            
+        except Exception as e:
+            error_msg = f"Failed to perform smart scroll: {str(e)}"
             logger.error(error_msg)
             return ActionResult(error=error_msg, include_in_memory=True)
