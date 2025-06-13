@@ -1002,7 +1002,20 @@ class Agent(Generic[Context]):
 			self.logger.error('❌  Browser is closed or disconnected, unable to proceed')
 			return [ActionResult(error='Browser closed or disconnected, unable to proceed', include_in_memory=False)]
 
-		if isinstance(error, (ValidationError, ValueError)):
+		# Check for Gemini/Google API specific errors
+		if 'internal error has occurred' in error_msg.lower() and 'gemini' in error_msg.lower():
+			self.logger.warning(f'{prefix}Gemini API internal error - reducing context and retrying')
+			# Aggressively reduce context for Gemini errors
+			self._message_manager.settings.max_input_tokens = int(self.settings.max_input_tokens * 0.6)
+			self.logger.info(
+				f'Reducing max input tokens to {self._message_manager.settings.max_input_tokens} due to Gemini error'
+			)
+			self._message_manager.cut_messages()
+			# Add small delay to avoid rapid retries
+			await asyncio.sleep(2)
+			error_msg = 'Gemini API error - reduced context size and retrying'
+		
+		elif isinstance(error, (ValidationError, ValueError)):
 			self.logger.error(f'{prefix}{error_msg}')
 			if 'Max token limit reached' in error_msg:
 				# cut tokens from history
@@ -1031,7 +1044,21 @@ class Agent(Generic[Context]):
 				self.logger.warning(f'{prefix}{error_msg}')
 				await asyncio.sleep(self.settings.retry_delay)
 			else:
-				self.logger.error(f'{prefix}{error_msg}')
+				# Check for LLM API errors that might be transient
+				api_error_patterns = [
+					'connection error',
+					'timeout',
+					'service unavailable',
+					'gateway timeout',
+					'bad gateway',
+					'request failed',
+				]
+				
+				if any(pattern in error_msg.lower() for pattern in api_error_patterns):
+					self.logger.warning(f'{prefix}Transient API error detected - will retry: {error_msg}')
+					await asyncio.sleep(min(self.settings.retry_delay, 5))
+				else:
+					self.logger.error(f'{prefix}{error_msg}')
 
 		return [ActionResult(error=error_msg, include_in_memory=True)]
 
@@ -1485,7 +1512,7 @@ class Agent(Generic[Context]):
 		actions: list[ActionModel],
 		check_for_new_elements: bool = True,
 	) -> list[ActionResult]:
-		"""Execute multiple actions"""
+		"""Execute multiple actions with intelligent batching for performance"""
 		results = []
 
 		cached_selector_map = await self.browser_session.get_selector_map()
@@ -1493,33 +1520,180 @@ class Agent(Generic[Context]):
 
 		await self.browser_session.remove_highlights()
 
-		for i, action in enumerate(actions):
-			if action.get_index() is not None and i != 0:
-				new_browser_state_summary = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
-				new_selector_map = new_browser_state_summary.selector_map
+		# Analyze actions to find independent ones that can be batched
+		action_batches = self._create_action_batches(actions)
+		
+		for batch_idx, batch in enumerate(action_batches):
+			if len(batch) == 1:
+				# Single action - execute normally
+				action = batch[0]
+				i = actions.index(action)
+				
+				if action.get_index() is not None and i != 0:
+					new_browser_state_summary = await self.browser_session.get_state_summary(cache_clickable_elements_hashes=False)
+					new_selector_map = new_browser_state_summary.selector_map
 
-				# Detect index change after previous action
-				orig_target = cached_selector_map.get(action.get_index())  # type: ignore
-				orig_target_hash = orig_target.hash.branch_path_hash if orig_target else None
-				new_target = new_selector_map.get(action.get_index())  # type: ignore
-				new_target_hash = new_target.hash.branch_path_hash if new_target else None
-				if orig_target_hash != new_target_hash:
-					msg = f'Element index changed after action {i} / {len(actions)}, because page changed.'
-					self.logger.info(msg)
-					results.append(ActionResult(extracted_content=msg, include_in_memory=True))
-					break
+					# Detect index change after previous action
+					orig_target = cached_selector_map.get(action.get_index())  # type: ignore
+					orig_target_hash = orig_target.hash.branch_path_hash if orig_target else None
+					new_target = new_selector_map.get(action.get_index())  # type: ignore
+					new_target_hash = new_target.hash.branch_path_hash if new_target else None
+					if orig_target_hash != new_target_hash:
+						msg = f'Element index changed after action {i} / {len(actions)}, because page changed.'
+						self.logger.info(msg)
+						results.append(ActionResult(extracted_content=msg, include_in_memory=True))
+						break
 
-				new_path_hashes = {e.hash.branch_path_hash for e in new_selector_map.values()}
-				if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
-					# next action requires index but there are new elements on the page
-					msg = f'Something new appeared after action {i} / {len(actions)}'
-					self.logger.info(msg)
-					results.append(ActionResult(extracted_content=msg, include_in_memory=True))
-					break
+					new_path_hashes = {e.hash.branch_path_hash for e in new_selector_map.values()}
+					if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
+						# next action requires index but there are new elements on the page
+						msg = f'Something new appeared after action {i} / {len(actions)}'
+						self.logger.info(msg)
+						results.append(ActionResult(extracted_content=msg, include_in_memory=True))
+						break
 
+				try:
+					await self._raise_if_stopped_or_paused()
+
+					# Execute action with retry logic
+					result = await self._execute_action_with_retry(
+						action=action,
+						max_retries=3,
+						base_delay=1.0
+					)
+
+					results.append(result)
+
+					# Get action name from the action model
+					action_data = action.model_dump(exclude_unset=True)
+					action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+					action_params = getattr(action, action_name, '')
+					self.logger.info(f'☑️ Executed action {i + 1}/{len(actions)}: {action_name}({action_params})')
+					if results[-1].is_done or results[-1].error:
+						break
+
+					await asyncio.sleep(self.browser_profile.wait_between_actions)
+
+				except asyncio.CancelledError:
+					# Gracefully handle task cancellation
+					self.logger.info(f'Action {i + 1} was cancelled due to Ctrl+C')
+					if not results:
+						# Add a result for the cancelled action
+						results.append(ActionResult(error='The action was cancelled due to Ctrl+C', include_in_memory=True))
+					raise InterruptedError('Action cancelled by user')
+			else:
+				# Multiple independent actions - execute in parallel
+				self.logger.info(f'🚀 Executing batch of {len(batch)} independent actions in parallel')
+				
+				try:
+					await self._raise_if_stopped_or_paused()
+					
+					# Create tasks for parallel execution
+					tasks = []
+					for action in batch:
+						task = self.controller.act(
+							action=action,
+							browser_session=self.browser_session,
+							page_extraction_llm=self.settings.page_extraction_llm,
+							sensitive_data=self.sensitive_data,
+							available_file_paths=self.settings.available_file_paths,
+							context=self.context,
+						)
+						tasks.append(task)
+					
+					# Execute all tasks in parallel
+					batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+					
+					# Process results
+					for action, result in zip(batch, batch_results):
+						if isinstance(result, Exception):
+							# Convert exception to ActionResult
+							error_result = ActionResult(error=str(result), include_in_memory=True)
+							results.append(error_result)
+						else:
+							results.append(result)
+						
+						# Log each action
+						action_data = action.model_dump(exclude_unset=True)
+						action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+						self.logger.info(f'☑️ Batch executed: {action_name}')
+					
+					# Check if any action in batch failed or is done
+					if any(r.is_done or r.error for r in results[-len(batch):]):
+						break
+						
+				except asyncio.CancelledError:
+					self.logger.info(f'Batch {batch_idx + 1} was cancelled due to Ctrl+C')
+					if not results:
+						results.append(ActionResult(error='The batch was cancelled due to Ctrl+C', include_in_memory=True))
+					raise InterruptedError('Batch cancelled by user')
+				
+				# Small delay after batch
+				await asyncio.sleep(self.browser_profile.wait_between_actions)
+				
+				# Update cached state after batch execution
+				cached_selector_map = await self.browser_session.get_selector_map()
+				cached_path_hashes = {e.hash.branch_path_hash for e in cached_selector_map.values()}
+
+		return results
+	
+	def _create_action_batches(self, actions: list[ActionModel]) -> list[list[ActionModel]]:
+		"""Group actions into batches of independent actions that can be executed in parallel"""
+		batches = []
+		current_batch = []
+		
+		# Actions that modify page state and can't be batched
+		state_modifying_actions = {
+			'click_element_by_index', 'click_element_with_verification',
+			'input_text', 'go_to_url', 'open_tab', 'close_tab',
+			'switch_tab', 'send_keys', 'upload_file'
+		}
+		
+		# Actions that can potentially be batched
+		batchable_actions = {
+			'extract_content', 'get_dropdown_options', 'save_pdf',
+			'read_sheet_contents', 'read_cell_contents'
+		}
+		
+		for action in actions:
+			action_data = action.model_dump(exclude_unset=True)
+			action_name = next(iter(action_data.keys())) if action_data else None
+			
+			if not action_name:
+				# Unknown action - execute separately
+				if current_batch:
+					batches.append(current_batch)
+					current_batch = []
+				batches.append([action])
+			elif action_name in batchable_actions and not action.get_index():
+				# This action can be batched if it doesn't depend on index
+				current_batch.append(action)
+			else:
+				# State-modifying action - flush current batch and execute separately
+				if current_batch:
+					batches.append(current_batch)
+					current_batch = []
+				batches.append([action])
+		
+		# Don't forget the last batch
+		if current_batch:
+			batches.append(current_batch)
+		
+		return batches
+	
+	async def _execute_action_with_retry(
+		self,
+		action: ActionModel,
+		max_retries: int = 3,
+		base_delay: float = 1.0
+	) -> ActionResult:
+		"""Execute an action with exponential backoff retry logic"""
+		last_error = None
+		action_data = action.model_dump(exclude_unset=True)
+		action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+		
+		for attempt in range(max_retries):
 			try:
-				await self._raise_if_stopped_or_paused()
-
 				result = await self.controller.act(
 					action=action,
 					browser_session=self.browser_session,
@@ -1528,29 +1702,69 @@ class Agent(Generic[Context]):
 					available_file_paths=self.settings.available_file_paths,
 					context=self.context,
 				)
-
-				results.append(result)
-
-				# Get action name from the action model
-				action_data = action.model_dump(exclude_unset=True)
-				action_name = next(iter(action_data.keys())) if action_data else 'unknown'
-				action_params = getattr(action, action_name, '')
-				self.logger.info(f'☑️ Executed action {i + 1}/{len(actions)}: {action_name}({action_params})')
-				if results[-1].is_done or results[-1].error or i == len(actions) - 1:
-					break
-
-				await asyncio.sleep(self.browser_profile.wait_between_actions)
-				# hash all elements. if it is a subset of cached_state its fine - else break (new elements on page)
-
-			except asyncio.CancelledError:
-				# Gracefully handle task cancellation
-				self.logger.info(f'Action {i + 1} was cancelled due to Ctrl+C')
-				if not results:
-					# Add a result for the cancelled action
-					results.append(ActionResult(error='The action was cancelled due to Ctrl+C', include_in_memory=True))
-				raise InterruptedError('Action cancelled by user')
-
-		return results
+				
+				# If successful or explicit error (not transient), return immediately
+				if not result.error or attempt == max_retries - 1:
+					return result
+				
+				# Check if error is retryable
+				error_lower = result.error.lower()
+				non_retryable_errors = [
+					'element with index',  # Element doesn't exist
+					'file upload',  # File upload dialog
+					'not found',  # Element not found
+					'does not exist',  # Element doesn't exist
+				]
+				
+				if any(err in error_lower for err in non_retryable_errors):
+					# Non-retryable error, return immediately
+					return result
+				
+				# Retryable error - log and retry
+				last_error = result.error
+				delay = base_delay * (2 ** attempt)  # Exponential backoff
+				self.logger.warning(
+					f"Action {action_name} failed (attempt {attempt + 1}/{max_retries}): {result.error}. "
+					f"Retrying in {delay}s..."
+				)
+				await asyncio.sleep(delay)
+				
+			except asyncio.TimeoutError:
+				# Timeout is retryable
+				last_error = "Action timed out"
+				if attempt < max_retries - 1:
+					delay = base_delay * (2 ** attempt)
+					self.logger.warning(
+						f"Action {action_name} timed out (attempt {attempt + 1}/{max_retries}). "
+						f"Retrying in {delay}s..."
+					)
+					await asyncio.sleep(delay)
+				else:
+					return ActionResult(
+						error=f"Action {action_name} timed out after {max_retries} attempts",
+						include_in_memory=True
+					)
+			except Exception as e:
+				# Unexpected error
+				last_error = str(e)
+				if attempt < max_retries - 1:
+					delay = base_delay * (2 ** attempt)
+					self.logger.warning(
+						f"Action {action_name} encountered error (attempt {attempt + 1}/{max_retries}): {e}. "
+						f"Retrying in {delay}s..."
+					)
+					await asyncio.sleep(delay)
+				else:
+					return ActionResult(
+						error=f"Action {action_name} failed after {max_retries} attempts: {last_error}",
+						include_in_memory=True
+					)
+		
+		# Should not reach here, but just in case
+		return ActionResult(
+			error=f"Action {action_name} failed after {max_retries} attempts: {last_error}",
+			include_in_memory=True
+		)
 
 	async def _validate_output(self) -> bool:
 		"""Validate the output of the last action is what the user wanted"""

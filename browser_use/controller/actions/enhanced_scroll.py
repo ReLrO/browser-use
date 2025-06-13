@@ -727,17 +727,51 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
             return ActionResult(error=error_msg, include_in_memory=True)
     
     @controller.action(
-        description="Smart scroll that automatically tries both directions to find content",
+        description="Smart scroll with pattern recognition to optimize search direction",
         param_model=SmartScrollToFindAction
     )
     async def smart_scroll_to_find(params: SmartScrollToFindAction, browser_session: BrowserSession) -> ActionResult:
         """
         Intelligently scroll to find content by:
-        1. Checking current scroll position
-        2. If at bottom, try scrolling up first
-        3. If at top, try scrolling down first
-        4. If in middle, try both directions
+        1. Using pattern recognition to predict scroll direction
+        2. Checking current scroll position
+        3. If at bottom, try scrolling up first
+        4. If at top, try scrolling down first
+        5. If in middle, use pattern hints
         """
+        # Pattern-based scroll direction hints
+        scroll_patterns = {
+            # Geography/location filters often at bottom
+            'geography': {'preferred': 'down', 'start_position': 'bottom'},
+            'location': {'preferred': 'down', 'start_position': 'bottom'},
+            'region': {'preferred': 'down', 'start_position': 'bottom'},
+            'country': {'preferred': 'down', 'start_position': 'bottom'},
+            
+            # Company/organization filters often in middle
+            'company': {'preferred': 'down', 'start_position': 'top'},
+            'organization': {'preferred': 'down', 'start_position': 'top'},
+            'employer': {'preferred': 'down', 'start_position': 'top'},
+            
+            # Seniority/level filters often at top
+            'seniority': {'preferred': 'down', 'start_position': 'top'},
+            'level': {'preferred': 'down', 'start_position': 'top'},
+            'director': {'preferred': 'down', 'start_position': 'top'},
+            'manager': {'preferred': 'down', 'start_position': 'top'},
+            
+            # Time-based filters often at bottom
+            'date': {'preferred': 'down', 'start_position': 'bottom'},
+            'posted': {'preferred': 'down', 'start_position': 'bottom'},
+            'recent': {'preferred': 'down', 'start_position': 'bottom'},
+        }
+        
+        # Check if text matches any pattern
+        text_lower = params.text.lower()
+        pattern_hint = None
+        for pattern, hint in scroll_patterns.items():
+            if pattern in text_lower:
+                pattern_hint = hint
+                logger.debug(f"Found scroll pattern '{pattern}' - suggesting {hint}")
+                break
         page = await browser_session.get_current_page()
         
         try:
@@ -824,13 +858,33 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                 const maxScroll = container.scrollHeight - container.clientHeight;
                 const scrollPercent = maxScroll > 0 ? (scrollTop / maxScroll) * 100 : 0;
                 
+                // Use pattern hint if provided
                 let directions = [];
-                if (scrollPercent >= 90) {
-                    directions = ['up', 'down'];
-                } else if (scrollPercent <= 10) {
-                    directions = ['down', 'up'];
+                if (options.patternHint) {
+                    const hint = options.patternHint;
+                    if (hint.start_position === 'bottom' && scrollPercent < 50) {
+                        // Jump to bottom first if pattern suggests it
+                        if (isRoot) {
+                            window.scrollTo(0, maxScroll);
+                        } else {
+                            container.scrollTop = maxScroll;
+                        }
+                        await new Promise(r => setTimeout(r, 500));
+                        directions = ['up', 'down'];
+                    } else if (hint.preferred === 'down') {
+                        directions = ['down', 'up'];
+                    } else {
+                        directions = ['up', 'down'];
+                    }
                 } else {
-                    directions = ['down', 'up'];
+                    // Default behavior based on current position
+                    if (scrollPercent >= 90) {
+                        directions = ['up', 'down'];
+                    } else if (scrollPercent <= 10) {
+                        directions = ['down', 'up'];
+                    } else {
+                        directions = ['down', 'up'];
+                    }
                 }
                 
                 const results = {
@@ -891,7 +945,8 @@ def register_enhanced_scroll_actions(controller: Controller) -> None:
                 "text": params.text,
                 "containerSelector": params.container_selector,
                 "maxScrollsPerDirection": params.max_scrolls_per_direction,
-                "scrollAmount": params.scroll_amount
+                "scrollAmount": params.scroll_amount,
+                "patternHint": pattern_hint
             }
             
             result = await page.evaluate(js_code, options)

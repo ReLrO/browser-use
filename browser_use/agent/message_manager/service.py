@@ -487,46 +487,65 @@ class MessageManager:
 		if diff <= 0:
 			return None
 
-		msg = self.state.history.messages[-1]
+		# First try the new sliding window approach
+		target_tokens = int(self.settings.max_input_tokens * 0.8)  # Keep 80% to leave room
+		
+		# Check if we can compress history
+		summary = self.state.history.compress_history(target_tokens)
+		if summary:
+			logger.info(f'Compressed history - removed old messages, keeping summary. Current tokens: {self.state.history.current_tokens}')
+			# Add summary as a system message
+			summary_msg = SystemMessage(content=summary)
+			self._add_message_with_tokens(summary_msg, position=1)  # After main system message
+			
+		# If still over limit, apply sliding window
+		if self.state.history.current_tokens > self.settings.max_input_tokens:
+			self.state.history.apply_sliding_window(target_tokens, preserve_recent=5)
+			logger.info(f'Applied sliding window - current tokens: {self.state.history.current_tokens}')
 
-		# if list with image remove image
-		if isinstance(msg.message.content, list):
-			text = ''
-			for item in msg.message.content:
-				if 'image_url' in item:
-					msg.message.content.remove(item)
-					diff -= self.settings.image_tokens
-					msg.metadata.tokens -= self.settings.image_tokens
-					self.state.history.current_tokens -= self.settings.image_tokens
-					logger.debug(
-						f'Removed image with {self.settings.image_tokens} tokens - total tokens now: {self.state.history.current_tokens}/{self.settings.max_input_tokens}'
-					)
-				elif 'text' in item and isinstance(item, dict):
-					text += item['text']
-			msg.message.content = text
-			self.state.history.messages[-1] = msg
+		# If STILL over (shouldn't happen often), fall back to old method
+		diff = self.state.history.current_tokens - self.settings.max_input_tokens
+		if diff > 0 and self.state.history.messages:
+			msg = self.state.history.messages[-1]
+			
+			# if list with image remove image
+			if isinstance(msg.message.content, list):
+				text = ''
+				for item in msg.message.content:
+					if 'image_url' in item:
+						msg.message.content.remove(item)
+						diff -= self.settings.image_tokens
+						msg.metadata.tokens -= self.settings.image_tokens
+						self.state.history.current_tokens -= self.settings.image_tokens
+						logger.debug(
+							f'Removed image with {self.settings.image_tokens} tokens - total tokens now: {self.state.history.current_tokens}/{self.settings.max_input_tokens}'
+						)
+					elif 'text' in item and isinstance(item, dict):
+						text += item['text']
+				msg.message.content = text
+				self.state.history.messages[-1] = msg
 
-		if diff <= 0:
-			return None
+			if diff <= 0:
+				return None
 
-		# if still over, remove text from state message proportionally to the number of tokens needed with buffer
-		# Calculate the proportion of content to remove
-		proportion_to_remove = diff / msg.metadata.tokens
-		if proportion_to_remove > 0.99:
-			raise ValueError(
-				f'Max token limit reached - history is too long - reduce the system prompt or task. '
-				f'proportion_to_remove: {proportion_to_remove}'
+			# if still over, remove text from state message proportionally to the number of tokens needed with buffer
+			# Calculate the proportion of content to remove
+			proportion_to_remove = diff / msg.metadata.tokens
+			if proportion_to_remove > 0.99:
+				raise ValueError(
+					f'Max token limit reached - history is too long - reduce the system prompt or task. '
+					f'proportion_to_remove: {proportion_to_remove}'
+				)
+			logger.debug(
+				f'Removing {proportion_to_remove * 100:.2f}% of the last message  {proportion_to_remove * msg.metadata.tokens:.2f} / {msg.metadata.tokens:.2f} tokens)'
 			)
-		logger.debug(
-			f'Removing {proportion_to_remove * 100:.2f}% of the last message  {proportion_to_remove * msg.metadata.tokens:.2f} / {msg.metadata.tokens:.2f} tokens)'
-		)
 
-		content = msg.message.content
-		characters_to_remove = int(len(content) * proportion_to_remove)
-		content = content[:-characters_to_remove]
+			content = msg.message.content
+			characters_to_remove = int(len(content) * proportion_to_remove)
+			content = content[:-characters_to_remove]
 
-		# remove tokens and old long message
-		self.state.history.remove_last_state_message()
+			# remove tokens and old long message
+			self.state.history.remove_last_state_message()
 
 		# new message with updated content
 		msg = HumanMessage(content=content)

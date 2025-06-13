@@ -23,6 +23,24 @@ class ViewportInfo:
 	height: int
 
 
+@dataclass
+class DOMCache:
+	"""Cache for DOM tree to avoid redundant extractions"""
+	url: str
+	dom_hash: str
+	element_tree: DOMElementNode
+	selector_map: SelectorMap
+	timestamp: float
+	
+	def is_valid(self, current_url: str, max_age: float = 5.0) -> bool:
+		"""Check if cache is still valid"""
+		import time
+		return (
+			self.url == current_url and 
+			(time.time() - self.timestamp) < max_age
+		)
+
+
 class DomService:
 	logger: logging.Logger
 
@@ -30,6 +48,10 @@ class DomService:
 		self.page = page
 		self.xpath_cache = {}
 		self.logger = logger or logging.getLogger(__name__)
+		self._dom_cache: DOMCache | None = None
+		self._cache_enabled = True
+		self._cache_hits = 0
+		self._cache_misses = 0
 
 		self.js_code = resources.files('browser_use.dom').joinpath('buildDomTree.js').read_text()
 
@@ -41,8 +63,54 @@ class DomService:
 		focus_element: int = -1,
 		viewport_expansion: int = 0,
 	) -> DOMState:
+		# Check cache first if enabled
+		current_url = self.page.url
+		
+		if self._cache_enabled and self._dom_cache and self._dom_cache.is_valid(current_url):
+			# Quick DOM hash check to see if page actually changed
+			try:
+				current_hash = await self._get_quick_dom_hash()
+				if current_hash == self._dom_cache.dom_hash:
+					self._cache_hits += 1
+					self.logger.debug(f'DOM cache hit for {current_url} (hits: {self._cache_hits}, misses: {self._cache_misses})')
+					return DOMState(element_tree=self._dom_cache.element_tree, selector_map=self._dom_cache.selector_map)
+			except:
+				# If hash check fails, invalidate cache
+				self._dom_cache = None
+		
+		# Cache miss - build new DOM tree
+		self._cache_misses += 1
 		element_tree, selector_map = await self._build_dom_tree(highlight_elements, focus_element, viewport_expansion)
+		
+		# Update cache
+		if self._cache_enabled:
+			try:
+				import time
+				dom_hash = await self._get_quick_dom_hash()
+				self._dom_cache = DOMCache(
+					url=current_url,
+					dom_hash=dom_hash,
+					element_tree=element_tree,
+					selector_map=selector_map,
+					timestamp=time.time()
+				)
+			except:
+				# If caching fails, continue without it
+				pass
+		
 		return DOMState(element_tree=element_tree, selector_map=selector_map)
+	
+	async def _get_quick_dom_hash(self) -> str:
+		"""Get a quick hash of the DOM for change detection"""
+		return await self.page.evaluate("""
+			() => {
+				// Quick hash based on element count and structure
+				const elements = document.querySelectorAll('*');
+				const interactiveCount = document.querySelectorAll('a, button, input, select, textarea, [onclick]').length;
+				const bodyText = document.body.innerText.length;
+				return `${elements.length}-${interactiveCount}-${bodyText}`;
+			}
+		""")
 
 	@time_execution_async('--get_cross_origin_iframes')
 	async def get_cross_origin_iframes(self) -> list[str]:
@@ -218,3 +286,15 @@ class DomService:
 		children_ids = node_data.get('children', [])
 
 		return element_node, children_ids
+	
+	def invalidate_cache(self) -> None:
+		"""Invalidate the DOM cache"""
+		self._dom_cache = None
+		self.logger.debug('DOM cache invalidated')
+	
+	def enable_cache(self, enabled: bool = True) -> None:
+		"""Enable or disable DOM caching"""
+		self._cache_enabled = enabled
+		if not enabled:
+			self.invalidate_cache()
+		self.logger.debug(f'DOM caching {"enabled" if enabled else "disabled"}')

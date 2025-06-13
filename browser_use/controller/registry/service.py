@@ -303,52 +303,82 @@ class Registry(Generic[Context]):
 		available_file_paths: list[str] | None = None,
 		#
 		context: Context | None = None,
+		timeout: int | None = None,
 	) -> Any:
-		"""Execute a registered action with simplified parameter handling"""
+		"""Execute a registered action with simplified parameter handling and timeout support"""
 		if action_name not in self.registry.actions:
 			raise ValueError(f'Action {action_name} not found')
 
 		action = self.registry.actions[action_name]
-		try:
-			# Create the validated Pydantic model
-			try:
-				validated_params = action.param_model(**params)
-			except Exception as e:
-				raise ValueError(f'Invalid parameters {params} for action {action_name}: {type(e)}: {e}') from e
-
-			if sensitive_data:
-				# Get current URL if browser_session is provided
-				current_url = None
-				if browser_session:
-					if browser_session.agent_current_page:
-						current_url = browser_session.agent_current_page.url
-					else:
-						current_page = await browser_session.get_current_page()
-						current_url = current_page.url if current_page else None
-				validated_params = self._replace_sensitive_data(validated_params, sensitive_data, current_url)
-
-			# Build special context dict
-			special_context = {
-				'context': context,
-				'browser_session': browser_session,
-				'browser': browser_session,  # legacy support
-				'browser_context': browser_session,  # legacy support
-				'page_extraction_llm': page_extraction_llm,
-				'available_file_paths': available_file_paths,
-				'has_sensitive_data': action_name == 'input_text' and bool(sensitive_data),
+		
+		# Default timeouts based on action type
+		if timeout is None:
+			timeout_map = {
+				'click_element_by_index': 30,
+				'click_element_with_verification': 35,
+				'input_text': 30,
+				'scroll_down': 10,
+				'scroll_up': 10,
+				'go_to_url': 60,
+				'wait': None,  # No timeout for explicit wait
+				'extract_content': 45,
+				'done': 5,
 			}
+			timeout = timeout_map.get(action_name, 30)  # Default 30s timeout
+		
+		async def execute_with_timeout():
+			try:
+				# Create the validated Pydantic model
+				try:
+					validated_params = action.param_model(**params)
+				except Exception as e:
+					raise ValueError(f'Invalid parameters {params} for action {action_name}: {type(e)}: {e}') from e
 
-			# Handle async page parameter if needed
-			if browser_session:
-				# Check if function signature includes 'page' parameter
-				sig = signature(action.function)
-				if 'page' in sig.parameters:
-					special_context['page'] = await browser_session.get_current_page()
+				if sensitive_data:
+					# Get current URL if browser_session is provided
+					current_url = None
+					if browser_session:
+						if browser_session.agent_current_page:
+							current_url = browser_session.agent_current_page.url
+						else:
+							current_page = await browser_session.get_current_page()
+							current_url = current_page.url if current_page else None
+					validated_params = self._replace_sensitive_data(validated_params, sensitive_data, current_url)
 
-			# All functions are now normalized to accept kwargs only
-			# Call with params and unpacked special context
-			return await action.function(params=validated_params, **special_context)
+				# Build special context dict
+				special_context = {
+					'context': context,
+					'browser_session': browser_session,
+					'browser': browser_session,  # legacy support
+					'browser_context': browser_session,  # legacy support
+					'page_extraction_llm': page_extraction_llm,
+					'available_file_paths': available_file_paths,
+					'has_sensitive_data': action_name == 'input_text' and bool(sensitive_data),
+				}
 
+				# Handle async page parameter if needed
+				if browser_session:
+					# Check if function signature includes 'page' parameter
+					sig = signature(action.function)
+					if 'page' in sig.parameters:
+						special_context['page'] = await browser_session.get_current_page()
+
+				# All functions are now normalized to accept kwargs only
+				# Call with params and unpacked special context
+				return await action.function(params=validated_params, **special_context)
+			except Exception as e:
+				# Re-raise to preserve stack trace
+				raise
+		
+		try:
+			if timeout:
+				return await asyncio.wait_for(execute_with_timeout(), timeout=timeout)
+			else:
+				return await execute_with_timeout()
+
+		except asyncio.TimeoutError:
+			logger.error(f'Action {action_name} timed out after {timeout}s')
+			raise RuntimeError(f'Action {action_name} timed out after {timeout} seconds. The action took too long to complete.')
 		except ValueError as e:
 			# Preserve ValueError messages from validation
 			if 'requires browser_session but none provided' in str(e) or 'requires page_extraction_llm but none provided' in str(

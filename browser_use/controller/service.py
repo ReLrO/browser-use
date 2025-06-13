@@ -187,6 +187,98 @@ class Controller(Generic[Context]):
 					return ActionResult(error=error_msg, success=False)
 
 		@self.registry.action(
+			'Click element with verification - checks element text before clicking to ensure correct target',
+			param_model=ClickElementAction,
+		)
+		async def click_element_with_verification(params: ClickElementAction, browser_session: BrowserSession, expected_text: str | None = None):
+			"""Click element only after verifying it's the correct one"""
+			# Check if element exists
+			selector_map = await browser_session.get_selector_map()
+			if params.index not in selector_map:
+				# Force a state refresh
+				await browser_session.get_state_summary(cache_clickable_elements_hashes=True)
+				selector_map = await browser_session.get_selector_map()
+				
+				if params.index not in selector_map:
+					max_index = max(selector_map.keys()) if selector_map else -1
+					return ActionResult(
+						extracted_content=f'Element with index {params.index} does not exist. Page has {len(selector_map)} interactive elements (indices 0-{max_index}).',
+						include_in_memory=True,
+						success=False,
+					)
+			
+			# Get element info for verification
+			element_node = await browser_session.get_dom_element_by_index(params.index)
+			element_text = element_node.get_all_text_till_next_clickable_element(max_depth=2).strip()
+			
+			# If expected_text is provided, verify it matches
+			if expected_text:
+				expected_lower = expected_text.lower()
+				element_lower = element_text.lower()
+				
+				# Check if expected text is contained in element text
+				if expected_lower not in element_lower:
+					# Try to find correct element by text
+					logger.warning(f"Element text mismatch at index {params.index}: expected '{expected_text}', got '{element_text}'")
+					
+					# Search for correct element
+					for idx, node in selector_map.items():
+						try:
+							node_element = await browser_session.get_dom_element_by_index(idx)
+							node_text = node_element.get_all_text_till_next_clickable_element(max_depth=2).strip().lower()
+							if expected_lower in node_text:
+								logger.info(f"Found correct element at index {idx} with text '{node_text}'")
+								# Update params to use correct index
+								params.index = idx
+								element_node = node_element
+								element_text = node_text
+								break
+						except:
+							continue
+					else:
+						# Couldn't find element with expected text
+						return ActionResult(
+							extracted_content=f"Could not find element with text '{expected_text}'. Element at index {params.index} has text '{element_text}'",
+							include_in_memory=True,
+							success=False,
+						)
+			
+			# Proceed with clicking the verified element
+			initial_pages = len(browser_session.tabs)
+			
+			# Check for file upload
+			if await browser_session.find_file_upload_element_by_index(params.index) is not None:
+				msg = f'Index {params.index} - has an element which opens file upload dialog. To upload files please use a specific function to upload files'
+				logger.info(msg)
+				return ActionResult(extracted_content=msg, include_in_memory=True, success=False)
+			
+			try:
+				download_path = await browser_session._click_element_node(element_node)
+				if download_path:
+					msg = f'💾  Downloaded file to {download_path}'
+				else:
+					msg = f'🖱️  Clicked verified element with index {params.index}: {element_text}'
+				
+				logger.info(msg)
+				if len(browser_session.tabs) > initial_pages:
+					new_tab_msg = 'New tab opened - switching to it'
+					msg += f' - {new_tab_msg}'
+					logger.info(new_tab_msg)
+					await browser_session.switch_to_tab(-1)
+				return ActionResult(extracted_content=msg, include_in_memory=True)
+			except Exception as e:
+				error_msg = str(e)
+				if 'Execution context was destroyed' in error_msg or 'Cannot find context with specified id' in error_msg:
+					logger.info('Page context changed during click, refreshing state...')
+					await browser_session.get_state_summary(cache_clickable_elements_hashes=True)
+					return ActionResult(
+						error='Page navigated during click. Refreshed state provided.', include_in_memory=True, success=False
+					)
+				else:
+					logger.warning(f'Element not clickable with index {params.index} - {error_msg}')
+					return ActionResult(error=error_msg, success=False)
+
+		@self.registry.action(
 			'Input text into a input interactive element',
 			param_model=InputTextAction,
 		)

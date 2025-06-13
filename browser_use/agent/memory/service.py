@@ -138,13 +138,20 @@ class Memory:
 		if len(messages_to_process) <= 1:
 			self.logger.debug('📜 Not enough non-memory messages to summarize')
 			return
+		
+		# Score messages by importance and filter low-importance ones
+		important_messages = self._filter_by_importance(messages_to_process)
+		if len(important_messages) < 2:
+			self.logger.debug('📜 Not enough important messages to create memory')
+			return
+		
 		# Create a procedural memory with timeout
 		try:
 			with ThreadPoolExecutor(max_workers=1) as executor:
-				future = executor.submit(self._create, [m.message for m in messages_to_process], current_step)
+				future = executor.submit(self._create, [m.message for m in important_messages], current_step)
 				memory_content = future.result(timeout=5)
 		except TimeoutError:
-			self.logger.warning('📜 Procedural memory creation timed out after 30 seconds')
+			self.logger.warning('📜 Procedural memory creation timed out after 5 seconds')
 			return
 		except Exception as e:
 			self.logger.error(f'📜 Error during procedural memory creation: {e}')
@@ -170,6 +177,57 @@ class Memory:
 		self.message_manager.state.history.current_tokens -= removed_tokens
 		self.message_manager.state.history.current_tokens += memory_tokens
 		self.logger.info(f'📜 History consolidated: {len(messages_to_process)} steps converted to long-term memory')
+
+	def _filter_by_importance(self, messages: list['ManagedMessage']) -> list['ManagedMessage']:
+		"""
+		Filter messages by importance to optimize memory usage.
+		
+		Scoring criteria:
+		- Error messages: High importance (score +3)
+		- Successful actions: Medium-high importance (score +2)
+		- State changes: Medium importance (score +1)
+		- Large token count relative to info: Low importance (score -1)
+		- Init/memory messages: Already handled separately (score 0)
+		"""
+		scored_messages = []
+		
+		for msg in messages:
+			score = 0
+			content = str(msg.message.content).lower()
+			
+			# High importance: Error messages
+			if 'error' in content or 'failed' in content or 'exception' in content:
+				score += 3
+				
+			# Medium-high importance: Successful actions
+			elif 'success' in content or 'completed' in content or 'clicked' in content:
+				score += 2
+				
+			# Medium importance: State changes
+			elif any(keyword in content for keyword in ['navigated', 'loaded', 'found', 'scrolled']):
+				score += 1
+				
+			# Low importance: High token count with little unique info
+			if msg.metadata.tokens > 1000:
+				# Penalize messages with high token count
+				score -= 1
+				
+			# Skip messages with very low scores
+			if score > 0:
+				scored_messages.append((score, msg))
+		
+		# Sort by score (descending) and take top messages
+		scored_messages.sort(key=lambda x: x[0], reverse=True)
+		
+		# Keep at least 50% of messages or minimum 2
+		keep_count = max(2, len(scored_messages) // 2)
+		important_messages = [msg for _, msg in scored_messages[:keep_count]]
+		
+		self.logger.debug(
+			f'📜 Filtered {len(messages)} messages to {len(important_messages)} important messages'
+		)
+		
+		return important_messages
 
 	def _create(self, messages: list[BaseMessage], current_step: int) -> str | None:
 		parsed_messages = convert_to_openai_messages(messages)
