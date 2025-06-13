@@ -1106,15 +1106,78 @@ class Agent(Generic[Context]):
 		else:
 			return input_messages
 
+	async def _invoke_llm_with_timeout(self, llm_callable, *args, timeout: float = 30.0, max_retries: int = 3, **kwargs):
+		"""Invoke LLM with timeout and retry logic
+		
+		Args:
+			llm_callable: The LLM method to call (e.g., llm.ainvoke)
+			timeout: Timeout in seconds for each attempt
+			max_retries: Maximum number of retry attempts
+			*args, **kwargs: Arguments to pass to the LLM method
+			
+		Returns:
+			The LLM response
+			
+		Raises:
+			asyncio.TimeoutError: If all attempts timeout
+			Exception: If all retries fail
+		"""
+		last_error = None
+		retry_delay = 2.0
+		
+		for attempt in range(max_retries):
+			try:
+				if attempt > 0:
+					self.logger.info(f"🔄 Retry attempt {attempt + 1}/{max_retries} after {retry_delay:.1f}s delay...")
+					await asyncio.sleep(retry_delay)
+					retry_delay *= 2  # Exponential backoff
+				
+				self.logger.debug(f"⏱️ Executing LLM call with {timeout}s timeout (attempt {attempt + 1}/{max_retries})...")
+				
+				result = await asyncio.wait_for(
+					llm_callable(*args, **kwargs),
+					timeout=timeout
+				)
+				
+				if attempt > 0:
+					self.logger.info(f"✅ LLM call successful after {attempt + 1} attempts")
+				
+				return result
+				
+			except asyncio.TimeoutError:
+				self.logger.warning(f"⏱️ LLM call timed out after {timeout}s (attempt {attempt + 1}/{max_retries})")
+				last_error = asyncio.TimeoutError(f"LLM call timed out after {timeout}s")
+				
+			except Exception as e:
+				self.logger.warning(f"❌ LLM call failed: {type(e).__name__}: {str(e)} (attempt {attempt + 1}/{max_retries})")
+				last_error = e
+				
+				# Don't retry on authentication errors
+				if any(err in str(e).lower() for err in ['unauthorized', 'forbidden', 'invalid api key', '401', '403']):
+					raise
+		
+		# All retries exhausted
+		self.logger.error(f"💀 All {max_retries} LLM call attempts failed. Last error: {last_error}")
+		raise last_error
+
 	@time_execution_async('--get_next_action')
 	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
 		"""Get next action from LLM based on current state"""
 		input_messages = self._convert_input_messages(input_messages)
 
+		# Get timeout settings from environment or use defaults
+		timeout = float(os.environ.get('BROWSER_USE_LLM_TIMEOUT', '30'))
+		max_retries = int(os.environ.get('BROWSER_USE_LLM_MAX_RETRIES', '3'))
+		
 		if self.tool_calling_method == 'raw':
 			self._log_llm_call_info(input_messages, self.tool_calling_method)
 			try:
-				output = await self.llm.ainvoke(input_messages)
+				output = await self._invoke_llm_with_timeout(
+					self.llm.ainvoke, 
+					input_messages,
+					timeout=timeout,
+					max_retries=max_retries
+				)
 				response = {'raw': output, 'parsed': None}
 			except Exception as e:
 				self.logger.error(f'Failed to invoke model: {str(e)}')
@@ -1135,7 +1198,12 @@ class Agent(Generic[Context]):
 		elif self.tool_calling_method is None:
 			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
 			try:
-				response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+				response: dict[str, Any] = await self._invoke_llm_with_timeout(
+					structured_llm.ainvoke,
+					input_messages,
+					timeout=timeout,
+					max_retries=max_retries
+				)  # type: ignore
 				parsed: AgentOutput | None = response['parsed']
 
 			except Exception as e:
@@ -1145,7 +1213,12 @@ class Agent(Generic[Context]):
 		else:
 			self._log_llm_call_info(input_messages, self.tool_calling_method)
 			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True, method=self.tool_calling_method)
-			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+			response: dict[str, Any] = await self._invoke_llm_with_timeout(
+				structured_llm.ainvoke,
+				input_messages,
+				timeout=timeout,
+				max_retries=max_retries
+			)  # type: ignore
 
 		# Handle tool call responses
 		if response.get('parsing_error') and 'raw' in response:
@@ -1801,7 +1874,14 @@ class Agent(Generic[Context]):
 			reason: str
 
 		validator = self.llm.with_structured_output(ValidationResult, include_raw=True)
-		response: dict[str, Any] = await validator.ainvoke(msg)  # type: ignore
+		timeout = float(os.environ.get('BROWSER_USE_LLM_TIMEOUT', '30'))
+		max_retries = int(os.environ.get('BROWSER_USE_LLM_MAX_RETRIES', '3'))
+		response: dict[str, Any] = await self._invoke_llm_with_timeout(
+			validator.ainvoke,
+			msg,
+			timeout=timeout,
+			max_retries=max_retries
+		)  # type: ignore
 		parsed: ValidationResult = response['parsed']
 		is_valid = parsed.is_valid
 		if not is_valid:
@@ -2079,7 +2159,14 @@ class Agent(Generic[Context]):
 
 		# Get planner output
 		try:
-			response = await self.settings.planner_llm.ainvoke(planner_messages)
+			timeout = float(os.environ.get('BROWSER_USE_LLM_TIMEOUT', '30'))
+			max_retries = int(os.environ.get('BROWSER_USE_LLM_MAX_RETRIES', '3'))
+			response = await self._invoke_llm_with_timeout(
+				self.settings.planner_llm.ainvoke,
+				planner_messages,
+				timeout=timeout,
+				max_retries=max_retries
+			)
 		except Exception as e:
 			self.logger.error(f'Failed to invoke planner: {str(e)}')
 			# Extract status code if available (e.g., from HTTP exceptions)
