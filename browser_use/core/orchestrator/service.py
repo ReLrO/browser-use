@@ -232,6 +232,10 @@ class ParallelActionOrchestrator:
 				if url_match:
 					url = url_match.group(0)
 			
+			# Ensure URL has protocol
+			if url and not url.startswith(('http://', 'https://')):
+				url = f'https://{url}'
+			
 			if url:
 				actions.append(Action(
 					id=f"{sub_intent.id}_navigate",
@@ -244,12 +248,48 @@ class ParallelActionOrchestrator:
 			element_desc = self._get_parameter_value(sub_intent, "element") or sub_intent.description
 			element_intent = ElementIntent(description=element_desc)
 			
-			# Click action
-			actions.append(Action(
-				id=f"{sub_intent.id}_click",
-				type=ActionType.CLICK,
-				parameters={"element_intent": element_intent}
-			))
+			logger.debug(f"INTERACTION sub-intent: desc='{sub_intent.description}'")
+			logger.debug(f"Parameters: {[(p.name, p.value) for p in sub_intent.parameters]}")
+			
+			# Check if this is a typing interaction
+			if any(keyword in sub_intent.description.lower() for keyword in ['type', 'enter', 'input', 'fill', 'write']):
+				# Get text value from parameters or description
+				text_value = self._get_parameter_value(sub_intent, "text")
+				if not text_value:
+					# Try to extract text from description
+					import re
+					# Look for quoted text
+					quoted_match = re.search(r"['\"]([^'\"]+)['\"]|'([^']+)'|\"([^\"]+)\"", sub_intent.description)
+					if quoted_match:
+						text_value = quoted_match.group(1) or quoted_match.group(2) or quoted_match.group(3)
+				
+				logger.debug(f"TYPE action: text_value='{text_value}', element_desc='{element_desc}'")
+				
+				if text_value:
+					actions.append(Action(
+						id=f"{sub_intent.id}_type",
+						type=ActionType.TYPE,
+						parameters={
+							"element_intent": element_intent,
+							"text": text_value,
+							"clear_first": True
+						}
+					))
+				else:
+					# No text found, default to click
+					logger.debug(f"No text found for typing, defaulting to click")
+					actions.append(Action(
+						id=f"{sub_intent.id}_click",
+						type=ActionType.CLICK,
+						parameters={"element_intent": element_intent}
+					))
+			else:
+				# Default to click action
+				actions.append(Action(
+					id=f"{sub_intent.id}_click",
+					type=ActionType.CLICK,
+					parameters={"element_intent": element_intent}
+				))
 		
 		elif sub_intent.type == IntentType.FORM_FILL:
 			# Multiple type actions for form fields
@@ -257,8 +297,22 @@ class ParallelActionOrchestrator:
 			
 			logger.debug(f"FORM_FILL: description='{sub_intent.description}', form_data={form_data}")
 			
-			# If no form_data, check if this is a login form fill
-			if not form_data and "username and password" in sub_intent.description.lower():
+			# Check if this is a simple typing task
+			text_value = self._get_parameter_value(sub_intent, "text") or self._get_parameter_value(sub_intent, "value")
+			if not form_data and text_value:
+				# Simple typing task
+				element_desc = self._get_parameter_value(sub_intent, "element") or sub_intent.description
+				actions.append(Action(
+					id=f"{sub_intent.id}_type",
+					type=ActionType.TYPE,
+					parameters={
+						"element_intent": ElementIntent(description=element_desc),
+						"text": text_value,
+						"clear_first": True
+					}
+				))
+			# If no form_data or text, check if this is a login form fill
+			elif not form_data and "username and password" in sub_intent.description.lower():
 				# Get username and password from parent intent parameters
 				username = None
 				password = None
@@ -437,18 +491,39 @@ class ParallelActionOrchestrator:
 		start_time = datetime.now()
 		last_error = None
 		
+		logger.info(f"Executing action: id={action.id}, type={action.type}, params={list(action.parameters.keys())}")
+		
 		for attempt in range(action.retry_count):
 			try:
 				# Resolve target element if needed
 				if action.type in [ActionType.CLICK, ActionType.TYPE, ActionType.HOVER, ActionType.SELECT]:
 					if "element_intent" in action.parameters:
 						element_intent = action.parameters["element_intent"]
+						logger.info(f"Resolving element for {action.type}: {element_intent.description if hasattr(element_intent, 'description') else element_intent}")
 						try:
 							# Element resolver expects perception_data as second argument
 							perception_data = self._execution_context.get("perception_data", {})
 							# Ensure page is in perception_data
 							if "page" not in perception_data and "page" in self._execution_context:
 								perception_data["page"] = self._execution_context["page"]
+							
+							# Ensure perception_data is JSON-serializable (some strategies might serialize it)
+							# Create a copy without non-serializable objects
+							clean_perception_data = {}
+							for key, value in perception_data.items():
+								if key == "page":
+									# Keep the page object as-is, it's needed by resolvers
+									clean_perception_data[key] = value
+								elif hasattr(value, 'model_dump'):
+									# Convert Pydantic models to dicts
+									clean_perception_data[key] = value.model_dump()
+								elif isinstance(value, (str, int, float, bool, list, dict, type(None))):
+									clean_perception_data[key] = value
+								else:
+									# Skip non-serializable objects
+									logger.debug(f"Skipping non-serializable perception_data key: {key} (type: {type(value).__name__})")
+							
+							perception_data = clean_perception_data
 							
 							resolved = await self.element_resolver.resolve_element(
 								element_intent,
@@ -552,21 +627,30 @@ class ParallelActionOrchestrator:
 		text = action.parameters.get("text", "")
 		clear_first = action.parameters.get("clear_first", False)
 		
-		logger.debug(f"Type action: text='{text[:20]}...', has_target={action.target is not None}")
+		logger.info(f"_handle_type called: text='{text}', has_target={action.target is not None}")
 		if action.target:
-			logger.debug(f"Target selector: {action.target.selector}")
+			logger.info(f"Target: selector='{action.target.selector}', element={action.target.element}")
 		
 		if action.target and action.target.selector:
 			try:
+				# First check if element exists
+				element = await page.query_selector(action.target.selector)
+				if not element:
+					logger.error(f"Element not found with selector: {action.target.selector}")
+					raise ValueError(f"Element not found: {action.target.selector}")
+				
+				logger.info(f"Element found, typing '{text}' into {action.target.selector}")
+				
 				if clear_first:
 					await page.fill(action.target.selector, text, timeout=action.timeout_ms)
 				else:
 					await page.type(action.target.selector, text, timeout=action.timeout_ms)
-				logger.debug(f"Successfully typed text into {action.target.selector}")
+				logger.info(f"Successfully typed text into {action.target.selector}")
 			except Exception as e:
 				logger.error(f"Failed to type: {e}")
 				raise
 		else:
+			logger.error(f"No valid target for type action - action.target: {action.target}")
 			raise ValueError(f"No valid target for type action - target: {action.target}, selector: {action.target.selector if action.target else 'N/A'}")
 		
 		return {"typed": text}
@@ -721,10 +805,22 @@ class ParallelActionOrchestrator:
 	
 	def _action_to_dict(self, action: Action) -> dict:
 		"""Convert action to dictionary for results"""
+		# Clean parameters to ensure JSON serializable
+		clean_params = {}
+		for key, value in action.parameters.items():
+			if key == "element_intent" and hasattr(value, "description"):
+				# Convert ElementIntent to simple dict
+				clean_params[key] = {"description": value.description}
+			elif hasattr(value, "__dict__"):
+				# Convert other objects to string representation
+				clean_params[key] = str(value)
+			else:
+				clean_params[key] = value
+		
 		return {
 			"id": action.id,
 			"type": action.type,
-			"parameters": action.parameters,
+			"parameters": clean_params,
 			"has_target": action.target is not None
 		}
 	

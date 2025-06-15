@@ -64,7 +64,8 @@ class NextGenBrowserAgent:
 			vision_engine=self.vision_engine,
 			dom_processor=self.dom_processor,
 			accessibility_processor=self.accessibility_processor,
-			perception_fusion=self.perception_fusion
+			perception_fusion=self.perception_fusion,
+			llm=self.llm
 		)
 		
 		self.action_orchestrator = ParallelActionOrchestrator(self.element_resolver)
@@ -151,8 +152,16 @@ class NextGenBrowserAgent:
 		if url and self.current_page:
 			await self.current_page.goto(url)
 		
-		# Update execution context
-		self._execution_context.update(context or {})
+		# Clean execution context to avoid serialization issues
+		clean_context = {}
+		if context:
+			for k, v in context.items():
+				# Skip non-serializable objects
+				if not hasattr(v, '_remote_object'):  # Skip Playwright objects
+					clean_context[k] = v
+		
+		# Reset execution context for this task
+		self._execution_context = clean_context
 		self._execution_context["start_time"] = datetime.now().isoformat()
 		
 		try:
@@ -171,7 +180,11 @@ class NextGenBrowserAgent:
 			
 			# Get current perception data
 			perception_data = await self._get_perception_data()
-			self._execution_context["perception_data"] = perception_data
+			# Make a copy without the page object for context
+			clean_perception_data = {k: v for k, v in perception_data.items() if k != "page"}
+			self._execution_context["perception_data"] = clean_perception_data
+			# Keep page in execution context separately
+			self._execution_context["page"] = self.current_page
 			
 			# Execute intent
 			execution_result = await self.action_orchestrator.execute_intent(
@@ -203,6 +216,9 @@ class NextGenBrowserAgent:
 			}
 			
 		except Exception as e:
+			import logging
+			logger = logging.getLogger(__name__)
+			logger.error(f"Error executing task: {e}", exc_info=True)
 			return {
 				"success": False,
 				"error": str(e),
@@ -299,7 +315,6 @@ class NextGenBrowserAgent:
 		
 		perception_data = {
 			"url": self.current_page.url,
-			"page": self.current_page,
 			"timestamp": datetime.now().isoformat()
 		}
 		
@@ -313,11 +328,17 @@ class NextGenBrowserAgent:
 		
 		# Run perception systems
 		perception_results = {}
+		perception_results_for_fusion = {}  # Keep raw results for fusion
 		
 		# DOM analysis
 		try:
 			dom_result = await self.dom_processor.analyze_page({"page": self.current_page})
-			perception_results["dom"] = dom_result
+			perception_results_for_fusion["dom"] = dom_result
+			# Convert to dict if it's a model
+			if hasattr(dom_result, 'model_dump'):
+				perception_results["dom"] = dom_result.model_dump(mode='json')
+			else:
+				perception_results["dom"] = dom_result
 		except Exception as e:
 			perception_results["dom"] = {"error": str(e)}
 		
@@ -325,7 +346,12 @@ class NextGenBrowserAgent:
 		if self.vision_engine and perception_data.get("screenshot"):
 			try:
 				vision_result = await self.vision_engine.analyze_page(perception_data)
-				perception_results["vision"] = vision_result
+				perception_results_for_fusion["vision"] = vision_result
+				# Convert to dict if it's a model
+				if hasattr(vision_result, 'model_dump'):
+					perception_results["vision"] = vision_result.model_dump(mode='json')
+				else:
+					perception_results["vision"] = vision_result
 			except Exception as e:
 				perception_results["vision"] = {"error": str(e)}
 		
@@ -333,15 +359,26 @@ class NextGenBrowserAgent:
 		if self.accessibility_processor:
 			try:
 				a11y_result = await self.accessibility_processor.analyze_page({"page": self.current_page})
-				perception_results["accessibility"] = a11y_result
+				perception_results_for_fusion["accessibility"] = a11y_result
+				# Convert to dict if it's a model
+				if hasattr(a11y_result, 'model_dump'):
+					perception_results["accessibility"] = a11y_result.model_dump(mode='json')
+				else:
+					perception_results["accessibility"] = a11y_result
 			except Exception as e:
 				perception_results["accessibility"] = {"error": str(e)}
 		
-		# Fuse results
-		if len([r for r in perception_results.values() if not isinstance(r, dict) or "error" not in r]) > 1:
+		# Fuse results using the raw PerceptionResult objects
+		if len(perception_results_for_fusion) > 1:
 			try:
-				fused_result = await self.perception_fusion.fuse_results(perception_results)
-				perception_data["fused_perception"] = fused_result
+				fused_result = await self.perception_fusion.fuse_results(perception_results_for_fusion)
+				if hasattr(fused_result, 'model_dump'):
+					perception_data["fused_perception"] = fused_result.model_dump(mode='json')
+				elif isinstance(fused_result, dict):
+					perception_data["fused_perception"] = fused_result
+				else:
+					# Convert to dict if it's not already
+					perception_data["fused_perception"] = {"elements": [], "errors": ["Failed to convert fusion result"]}
 			except Exception:
 				pass
 		

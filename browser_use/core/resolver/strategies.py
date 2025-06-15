@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from browser_use.perception.base import PerceptionElement, PerceptionQuery
 from browser_use.perception.dom.simple_element_finder import SimpleElementFinder
 from browser_use.core.intent.views import ElementIntent
+from browser_use.core.resolver.llm_element_finder import LLMElementFinder
 from playwright.async_api import Page
 import logging
 
@@ -82,3 +83,32 @@ class DOMProcessorStrategy(ResolutionStrategy):
         
         elements = await self.dom_processor.find_elements(query)
         return elements[0] if elements else None
+
+
+class LLMFinderStrategy(ResolutionStrategy):
+    """Strategy that uses LLM to find elements"""
+    
+    def __init__(self, llm):
+        self.llm_finder = LLMElementFinder(llm)
+    
+    async def resolve(
+        self, 
+        element_intent: ElementIntent, 
+        perception_data: Dict[str, Any],
+        page: Page
+    ) -> Optional[PerceptionElement]:
+        """Resolve using LLM element finder"""
+        
+        logger.debug(f"LLMFinderStrategy resolving: {element_intent.description}")
+        
+        element = await self.llm_finder.find_element(
+            page=page,
+            element_intent=element_intent
+        )
+        
+        if element:
+            logger.debug(f"LLM found element: {element.selector}")
+        else:
+            logger.debug("LLM could not find element")
+            
+        return element

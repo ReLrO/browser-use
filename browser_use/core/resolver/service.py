@@ -15,7 +15,7 @@ from browser_use.perception.fusion.service import MultiModalPerceptionFusion
 from browser_use.core.intent.views import ElementIntent
 from browser_use.utils import time_execution_async
 from playwright.async_api import Page
-from browser_use.core.resolver.strategies import SimpleFinderStrategy, DOMProcessorStrategy
+from browser_use.core.resolver.strategies import SimpleFinderStrategy, DOMProcessorStrategy, LLMFinderStrategy
 import logging
 
 logger = logging.getLogger(__name__)
@@ -76,17 +76,22 @@ class MultiStrategyElementResolver:
 		vision_engine: Optional[VisionEngine] = None,
 		dom_processor: Optional[IncrementalDOMProcessor] = None,
 		accessibility_processor: Optional[AccessibilityProcessor] = None,
-		perception_fusion: Optional[MultiModalPerceptionFusion] = None
+		perception_fusion: Optional[MultiModalPerceptionFusion] = None,
+		llm = None
 	):
 		self.vision_engine = vision_engine
 		self.dom_processor = dom_processor
 		self.accessibility_processor = accessibility_processor
 		self.perception_fusion = perception_fusion or MultiModalPerceptionFusion()
+		self.llm = llm
 		
-		# Initialize resolution strategies
-		self.strategies = [
-			SimpleFinderStrategy(),  # Primary strategy
-		]
+		# Initialize resolution strategies - LLM first if available
+		self.strategies = []
+		
+		if llm:
+			self.strategies.append(LLMFinderStrategy(llm))
+		
+		self.strategies.append(SimpleFinderStrategy())  # Fallback strategy
 		
 		if dom_processor:
 			self.strategies.append(DOMProcessorStrategy(dom_processor))

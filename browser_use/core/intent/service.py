@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Optional
 from datetime import datetime
 import json
+import logging
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -36,9 +37,9 @@ class IntentAnalyzer:
 				"typical_parameters": ["query", "filters", "sort_by"]
 			},
 			"fill_form": {
-				"keywords": ["fill", "complete", "submit form", "enter information"],
+				"keywords": ["fill", "complete", "submit form", "enter information", "type", "input", "write"],
 				"type": IntentType.FORM_FILL,
-				"typical_parameters": ["form_data", "submit_after"]
+				"typical_parameters": ["form_data", "submit_after", "text", "value"]
 			},
 			"navigate": {
 				"keywords": ["go to", "navigate", "open", "visit"],
@@ -70,6 +71,13 @@ class IntentAnalyzer:
 		
 		try:
 			response = await self.llm.ainvoke(messages)
+			
+			# Debug logging
+			import logging
+			logger = logging.getLogger(__name__)
+			logger.info(f"Task: {task}")
+			logger.info(f"LLM Response: {response.content[:500]}...")
+			
 			analysis = self._parse_llm_response(response.content)
 			
 			# Enhance with quick match if available
@@ -130,7 +138,18 @@ Respond with a JSON object following this structure:
   "clarification_questions": []
 }
 
-Be specific and actionable in your analysis."""
+Be specific and actionable in your analysis.
+
+Intent type guidance:
+- navigation: Going to URLs or pages
+- form_fill: Typing text into input fields, textareas, or filling forms
+- interaction: Clicking buttons, links, checkboxes, radio buttons
+- search: Finding elements or information on a page
+- extraction: Getting data from the page
+- authentication: Login/logout operations
+- verification: Checking page state or content
+
+For typing tasks, use 'form_fill' type with the text to type in parameters."""
 	
 	def _build_user_prompt(self, task: str, context: Optional[dict], quick_match: Optional[dict]) -> str:
 		"""Build the user prompt with task and context"""
@@ -160,7 +179,9 @@ Be specific and actionable in your analysis."""
 			
 			# Create sub-intents
 			sub_intents = []
+			logger = logging.getLogger(__name__)
 			for idx, sub_data in enumerate(data.get("sub_intents", [])):
+				logger.info(f"Sub-intent {idx}: type={sub_data['type']}, desc={sub_data['description']}")
 				sub_intent = SubIntent(
 					description=sub_data["description"],
 					type=IntentType(sub_data["type"]),
