@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from enum import Enum
 import networkx as nx
 
-from browser_use.core.intent.views import Intent, SubIntent, IntentExecutionResult
+from browser_use.core.intent.views import Intent, SubIntent, IntentExecutionResult, IntentType, ElementIntent
 from browser_use.core.resolver.service import MultiStrategyElementResolver, ResolvedElement
 from browser_use.utils import time_execution_async
 from playwright.async_api import Page
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ActionType(str, Enum):
@@ -153,6 +156,7 @@ class ParallelActionOrchestrator:
 		start_time = datetime.now()
 		self._execution_context = context or {}
 		self._execution_context["page"] = page
+		self._execution_context["current_intent"] = intent
 		
 		try:
 			# Build execution plan
@@ -212,9 +216,22 @@ class ParallelActionOrchestrator:
 		"""Convert a sub-intent to concrete actions"""
 		actions = []
 		
+		# Debug logging
+		import logging
+		logger = logging.getLogger(__name__)
+		logger.debug(f"Converting sub-intent: type={sub_intent.type}, desc={sub_intent.description}")
+		logger.debug(f"Sub-intent parameters: {sub_intent.parameters}")
+		
 		# Map intent types to actions
 		if sub_intent.type == IntentType.NAVIGATION:
 			url = self._get_parameter_value(sub_intent, "url")
+			if not url:
+				# Try to extract URL from description
+				import re
+				url_match = re.search(r'https?://[^\s]+', sub_intent.description)
+				if url_match:
+					url = url_match.group(0)
+			
 			if url:
 				actions.append(Action(
 					id=f"{sub_intent.id}_navigate",
@@ -238,22 +255,71 @@ class ParallelActionOrchestrator:
 			# Multiple type actions for form fields
 			form_data = self._get_parameter_value(sub_intent, "form_data", {})
 			
-			for field_name, field_value in form_data.items():
-				element_intent = ElementIntent(
-					description=f"Input field for {field_name}",
-					element_type="input",
-					attributes={"name": field_name}
-				)
+			logger.debug(f"FORM_FILL: description='{sub_intent.description}', form_data={form_data}")
+			
+			# If no form_data, check if this is a login form fill
+			if not form_data and "username and password" in sub_intent.description.lower():
+				# Get username and password from parent intent parameters
+				username = None
+				password = None
 				
-				actions.append(Action(
-					id=f"{sub_intent.id}_type_{field_name}",
-					type=ActionType.TYPE,
-					parameters={
-						"element_intent": element_intent,
-						"text": field_value,
-						"clear_first": True
-					}
-				))
+				# Find parent intent through context
+				parent_intent = self._execution_context.get("current_intent")
+				logger.debug(f"Parent intent: {parent_intent}")
+				if parent_intent:
+					logger.debug(f"Parent intent parameters: {[(p.name, p.value[:20] + '...' if len(p.value) > 20 else p.value) for p in parent_intent.parameters]}")
+					for param in parent_intent.parameters:
+						if param.name == "username":
+							username = param.value
+						elif param.name == "password":
+							password = param.value
+				
+				logger.debug(f"Found credentials: username='{username[:20] + '...' if username and len(username) > 20 else username}', password={'*' * len(password) if password else 'None'}")
+				
+				if username:
+					actions.append(Action(
+						id=f"{sub_intent.id}_type_username",
+						type=ActionType.TYPE,
+						parameters={
+							"element_intent": ElementIntent(
+								description="Username or email input field",
+								element_type="input"
+							),
+							"text": username,
+							"clear_first": True
+						}
+					))
+				
+				if password:
+					actions.append(Action(
+						id=f"{sub_intent.id}_type_password",
+						type=ActionType.TYPE,
+						parameters={
+							"element_intent": ElementIntent(
+								description="Password input field",
+								element_type="input"
+							),
+							"text": password,
+							"clear_first": True
+						}
+					))
+			else:
+				for field_name, field_value in form_data.items():
+					element_intent = ElementIntent(
+						description=f"Input field for {field_name}",
+						element_type="input",
+						attributes={"name": field_name}
+					)
+					
+					actions.append(Action(
+						id=f"{sub_intent.id}_type_{field_name}",
+						type=ActionType.TYPE,
+						parameters={
+							"element_intent": element_intent,
+							"text": field_value,
+							"clear_first": True
+						}
+					))
 		
 		elif sub_intent.type == IntentType.EXTRACTION:
 			# Extract data action
@@ -377,17 +443,33 @@ class ParallelActionOrchestrator:
 				if action.type in [ActionType.CLICK, ActionType.TYPE, ActionType.HOVER, ActionType.SELECT]:
 					if "element_intent" in action.parameters:
 						element_intent = action.parameters["element_intent"]
-						resolved = await self.element_resolver.resolve_element(
-							element_intent,
-							self._execution_context,
-							self._execution_context["page"]
-						)
-						action.target = resolved
+						try:
+							# Element resolver expects perception_data as second argument
+							perception_data = self._execution_context.get("perception_data", {})
+							# Ensure page is in perception_data
+							if "page" not in perception_data and "page" in self._execution_context:
+								perception_data["page"] = self._execution_context["page"]
+							
+							resolved = await self.element_resolver.resolve_element(
+								element_intent,
+								perception_data,
+								self._execution_context["page"]
+							)
+							action.target = resolved
+							logger.debug(f"Resolved element for {action.id}: selector={resolved.selector if resolved else 'None'}")
+						except Exception as e:
+							logger.error(f"Failed to resolve element for {action.id}: {e}")
+							# For now, continue without failing completely
+							action.target = None
 				
 				# Execute the action
 				handler = self._action_handlers.get(action.type)
 				if not handler:
 					raise ValueError(f"No handler for action type: {action.type}")
+				
+				# Ensure execution context has page
+				if "page" not in self._execution_context:
+					raise ValueError("No page in execution context")
 				
 				result_data = await handler(action, self._execution_context)
 				
@@ -442,13 +524,23 @@ class ParallelActionOrchestrator:
 		"""Handle click action"""
 		page = context["page"]
 		
+		logger.debug(f"Click action: has_target={action.target is not None}")
+		if action.target:
+			logger.debug(f"Target selector: {action.target.selector}, has_bbox: {action.target.bounding_box is not None}")
+		
 		if action.target and action.target.selector:
 			# Use selector
-			await page.click(action.target.selector, timeout=action.timeout_ms)
+			try:
+				await page.click(action.target.selector, timeout=action.timeout_ms)
+				logger.debug(f"Successfully clicked {action.target.selector}")
+			except Exception as e:
+				logger.error(f"Failed to click: {e}")
+				raise
 		elif action.target and action.target.bounding_box:
 			# Use coordinates
 			x, y = await action.target.click_point()
 			await page.mouse.click(x, y)
+			logger.debug(f"Successfully clicked at ({x}, {y})")
 		else:
 			raise ValueError("No valid target for click action")
 		
@@ -460,13 +552,22 @@ class ParallelActionOrchestrator:
 		text = action.parameters.get("text", "")
 		clear_first = action.parameters.get("clear_first", False)
 		
+		logger.debug(f"Type action: text='{text[:20]}...', has_target={action.target is not None}")
+		if action.target:
+			logger.debug(f"Target selector: {action.target.selector}")
+		
 		if action.target and action.target.selector:
-			if clear_first:
-				await page.fill(action.target.selector, text, timeout=action.timeout_ms)
-			else:
-				await page.type(action.target.selector, text, timeout=action.timeout_ms)
+			try:
+				if clear_first:
+					await page.fill(action.target.selector, text, timeout=action.timeout_ms)
+				else:
+					await page.type(action.target.selector, text, timeout=action.timeout_ms)
+				logger.debug(f"Successfully typed text into {action.target.selector}")
+			except Exception as e:
+				logger.error(f"Failed to type: {e}")
+				raise
 		else:
-			raise ValueError("No valid target for type action")
+			raise ValueError(f"No valid target for type action - target: {action.target}, selector: {action.target.selector if action.target else 'N/A'}")
 		
 		return {"typed": text}
 	

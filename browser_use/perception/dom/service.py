@@ -10,6 +10,7 @@ from browser_use.perception.base import (
 	IPerceptionSystem, PerceptionElement, PerceptionResult,
 	PerceptionQuery, PerceptionCapability, BoundingBox
 )
+from browser_use.perception.dom.simple_element_finder import SimpleElementFinder
 from browser_use.utils import time_execution_async
 
 
@@ -127,7 +128,17 @@ class IncrementalDOMProcessor(IPerceptionSystem):
 			elif query.element_type:
 				elements = await self._find_by_type(page, query.element_type)
 			else:
-				elements = await self._find_by_description(page, query.description)
+				# Use SimpleElementFinder with all available information
+				element = await SimpleElementFinder.find_element_by_description(
+					page=page,
+					description=query.description,
+					element_type=query.element_type,
+					attributes=query.attributes
+				)
+				if element:
+					elements = [element]
+				else:
+					elements = await self._find_by_description(page, query.description)
 			
 			# Cache results
 			for element in elements[:5]:  # Cache top 5 results
@@ -525,9 +536,17 @@ class IncrementalDOMProcessor(IPerceptionSystem):
 		return await self._find_by_selector(page, element_type)
 	
 	async def _find_by_description(self, page: Page, description: str) -> list[PerceptionElement]:
-		"""Find elements by description - uses heuristics"""
-		# This is a simplified implementation
-		# In reality, this would use more sophisticated matching
+		"""Find elements by description using SimpleElementFinder"""
+		# Use the SimpleElementFinder for better element resolution
+		element = await SimpleElementFinder.find_element_by_description(
+			page=page,
+			description=description
+		)
+		
+		if element:
+			return [element]
+		
+		# Fallback to original logic if SimpleElementFinder doesn't find anything
 		words = description.lower().split()
 		
 		# Try to find by text content first

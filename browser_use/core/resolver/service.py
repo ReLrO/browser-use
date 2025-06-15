@@ -15,6 +15,10 @@ from browser_use.perception.fusion.service import MultiModalPerceptionFusion
 from browser_use.core.intent.views import ElementIntent
 from browser_use.utils import time_execution_async
 from playwright.async_api import Page
+from browser_use.core.resolver.strategies import SimpleFinderStrategy, DOMProcessorStrategy
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ResolutionStrategy(str, Enum):
@@ -79,6 +83,14 @@ class MultiStrategyElementResolver:
 		self.accessibility_processor = accessibility_processor
 		self.perception_fusion = perception_fusion or MultiModalPerceptionFusion()
 		
+		# Initialize resolution strategies
+		self.strategies = [
+			SimpleFinderStrategy(),  # Primary strategy
+		]
+		
+		if dom_processor:
+			self.strategies.append(DOMProcessorStrategy(dom_processor))
+		
 		# Strategy weights for scoring
 		self.strategy_weights = {
 			ResolutionStrategy.TEST_ID: 1.0,
@@ -101,56 +113,35 @@ class MultiStrategyElementResolver:
 		intent: ElementIntent,
 		perception_data: Dict[str, Any],
 		page: Page
-	) -> ResolvedElement:
+	) -> Optional[ResolvedElement]:
 		"""Resolve an element using multiple strategies"""
 		
-		# Check cache first
-		cache_key = self._get_cache_key(intent)
-		if cached := self._get_from_cache(cache_key):
-			return cached
+		logger.debug(f"Resolving element: description='{intent.description}', type='{intent.element_type}'")
+		logger.debug(f"Element attributes: {intent.attributes}")
 		
-		# Prepare context for strategies
-		context = {
-			"page": page,
-			"screenshot": perception_data.get("screenshot"),
-			"url": perception_data.get("url", page.url),
-			"perception_results": perception_data.get("perception_results", {})
-		}
-		
-		# Try strategies in parallel
-		strategies = self._select_strategies(intent)
-		
-		# Execute strategies concurrently
-		tasks = []
-		for strategy in strategies:
-			task = self._execute_strategy(strategy, intent, context)
-			tasks.append((strategy, task))
-		
-		# Gather results
-		results = []
-		for strategy, task in tasks:
+		# Try each strategy
+		for strategy in self.strategies:
 			try:
-				result = await task
-				if result:
-					results.append((strategy, result))
+				logger.debug(f"Trying strategy: {strategy.__class__.__name__}")
+				element = await strategy.resolve(intent, perception_data, page)
+				if element:
+					logger.debug(f"Found element with {strategy.__class__.__name__}: selector={element.selector}")
+					# Return a ResolvedElement
+					return ResolvedElement(
+						element=element,
+						confidence=0.9,
+						strategy=ResolutionStrategy.SEMANTIC_SEARCH,
+						resolution_time_ms=0
+					)
+				else:
+					logger.debug(f"No element found with {strategy.__class__.__name__}")
 			except Exception as e:
-				# Log error but continue with other strategies
+				logger.debug(f"Strategy {strategy.__class__.__name__} failed: {e}")
+				# Log but continue with other strategies
 				pass
 		
-		# Score and rank results
-		best_match = self._score_and_rank(results, intent)
-		
-		if not best_match:
-			# Fallback to deep search
-			best_match = await self._deep_search(intent, context)
-		
-		if best_match:
-			# Cache the result
-			self._add_to_cache(cache_key, best_match)
-			return best_match
-		
-		# No element found
-		raise ElementNotFoundError(f"Could not resolve element: {intent.description}")
+		logger.warning(f"Could not resolve element: {intent.description}")
+		return None
 	
 	def _select_strategies(self, intent: ElementIntent) -> List[ResolutionStrategy]:
 		"""Select appropriate strategies based on intent"""
@@ -313,7 +304,12 @@ class MultiStrategyElementResolver:
 		results = {}
 		
 		if self.dom_processor:
-			query = PerceptionQuery(description=intent.description, context=context)
+			query = PerceptionQuery(
+				description=intent.description, 
+				element_type=intent.element_type,
+				attributes=intent.attributes,
+				context=context
+			)
 			results["dom"] = await self.dom_processor.find_elements(query)
 		
 		if self.accessibility_processor:

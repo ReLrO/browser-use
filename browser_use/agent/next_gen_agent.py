@@ -153,7 +153,7 @@ class NextGenBrowserAgent:
 		
 		# Update execution context
 		self._execution_context.update(context or {})
-		self._execution_context["start_time"] = datetime.now()
+		self._execution_context["start_time"] = datetime.now().isoformat()
 		
 		try:
 			# Analyze task into intent
@@ -198,7 +198,8 @@ class NextGenBrowserAgent:
 					"criteria_met": execution_result.criteria_met,
 					"screenshot": execution_result.verification_screenshot
 				},
-				"errors": execution_result.errors
+				"errors": execution_result.errors,
+				"data": getattr(execution_result, 'extracted_data', {})
 			}
 			
 		except Exception as e:
@@ -218,6 +219,10 @@ class NextGenBrowserAgent:
 		
 		await self.intent_manager.register_intent(intent)
 		
+		# Initialize execution context if not exists
+		if not hasattr(self, '_execution_context'):
+			self._execution_context = {}
+		
 		perception_data = await self._get_perception_data()
 		self._execution_context["perception_data"] = perception_data
 		
@@ -233,21 +238,24 @@ class NextGenBrowserAgent:
 	
 	async def _start_browser(self) -> None:
 		"""Start browser session"""
-		self.browser_session = BrowserSession(self.browser_profile)
-		browser = await self.browser_session.start()
+		self.browser_session = BrowserSession(browser_profile=self.browser_profile)
+		await self.browser_session.start()
 		
 		# Get or create page
-		contexts = browser.contexts
-		if contexts:
-			context = contexts[0]
+		if self.browser_session.browser and self.browser_session.browser.contexts:
+			context = self.browser_session.browser.contexts[0]
 			pages = context.pages
 			if pages:
 				self.current_page = pages[0]
 			else:
 				self.current_page = await context.new_page()
-		else:
-			context = await browser.new_context()
+		elif self.browser_session.browser:
+			context = await self.browser_session.browser.new_context()
 			self.current_page = await context.new_page()
+		else:
+			# Use the browser context from session
+			if self.browser_session.browser_context:
+				self.current_page = await self.browser_session.browser_context.new_page()
 		
 		# Set up monitoring
 		if self.state_manager:
@@ -292,7 +300,7 @@ class NextGenBrowserAgent:
 		perception_data = {
 			"url": self.current_page.url,
 			"page": self.current_page,
-			"timestamp": datetime.now()
+			"timestamp": datetime.now().isoformat()
 		}
 		
 		# Take screenshot if vision enabled
