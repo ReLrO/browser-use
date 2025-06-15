@@ -85,13 +85,20 @@ class MultiStrategyElementResolver:
 		self.perception_fusion = perception_fusion or MultiModalPerceptionFusion()
 		self.llm = llm
 		
-		# Initialize resolution strategies - LLM first if available
+		# Initialize resolution strategies - Vision first for true understanding
 		self.strategies = []
 		
+		# Vision strategy FIRST if available - this is the key change
+		if vision_engine and llm:
+			from browser_use.core.resolver.vision_strategy import VisionResolutionStrategy
+			self.strategies.append(VisionResolutionStrategy(llm))
+			logger.info("Vision resolution strategy enabled")
+		
 		if llm:
+			# LLM finder for intelligent element matching
 			self.strategies.append(LLMFinderStrategy(llm))
 		
-		self.strategies.append(SimpleFinderStrategy())  # Fallback strategy
+		self.strategies.append(SimpleFinderStrategy())  # Basic fallback
 		
 		if dom_processor:
 			self.strategies.append(DOMProcessorStrategy(dom_processor))
@@ -124,13 +131,219 @@ class MultiStrategyElementResolver:
 		logger.debug(f"Resolving element: description='{intent.description}', type='{intent.element_type}'")
 		logger.debug(f"Element attributes: {intent.attributes}")
 		
+		# CRITICAL FIX: Ensure we have page elements for resolution
+		# Extract elements directly if not in perception data
+		if 'page_elements' not in perception_data or not perception_data['page_elements']:
+			logger.debug("No page elements in perception data, checking cache or extracting")
+			
+			# Check cache first
+			from browser_use.core.caching import page_elements_cache
+			current_url = page.url
+			cached_elements = await page_elements_cache.get(current_url)
+			
+			if cached_elements:
+				logger.debug(f"Using cached page elements: {len(cached_elements)} elements")
+				perception_data['page_elements'] = cached_elements
+			else:
+				try:
+					# Use JavaScript to get comprehensive element data
+					elements = await page.evaluate("""() => {
+					const interactiveSelectors = [
+						// Prioritize input elements
+						'input[type="search"]', 'input[type="text"]', 'input:not([type="hidden"]):not([type="submit"]):not([type="button"])',
+						'textarea', '[role="searchbox"]', '[role="textbox"]',
+						// Then buttons  
+						'button', '[type="submit"]', '[type="button"]', '[role="button"]',
+						// Then other interactive elements
+						'a', 'select',
+						'[role="link"]', '[role="combobox"]', '[role="checkbox"]', '[role="radio"]',
+						'[onclick]', '[ng-click]', '[data-click]', '*[class*="btn"]',
+						'*[class*="button"]', 'label[for]', '[contenteditable="true"]',
+						'[tabindex]:not([tabindex="-1"])', 'summary', 'details',
+						'div[role="button"]', 'span[role="button"]', '[href]', 'area[href]'
+					];
+					
+					const elements = [];
+					const seen = new Set();
+					const maxElements = 200; // Get more elements for better coverage
+					
+					// Helper to get element text and context
+					const getElementText = (el) => {
+						// Try different methods to get text
+						let text = el.textContent || '';
+						if (!text.trim() && el.value) text = el.value;
+						if (!text.trim() && el.placeholder) text = el.placeholder;
+						if (!text.trim() && el.getAttribute('aria-label')) text = el.getAttribute('aria-label');
+						if (!text.trim() && el.getAttribute('title')) text = el.getAttribute('title');
+						if (!text.trim() && el.getAttribute('alt')) text = el.getAttribute('alt');
+						
+						// For inputs, also include the label text if available
+						if (el.tagName === 'INPUT' && el.id) {
+							const label = document.querySelector(`label[for="${el.id}"]`);
+							if (label) text = label.textContent + ' ' + text;
+						}
+						
+						// For buttons with only icons, try to infer purpose
+						if ((el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') && !text.trim()) {
+							// Check for common icon classes
+							const classes = el.className || '';
+							if (classes.includes('search') || classes.includes('submit')) text = 'Search/Submit button';
+							else if (classes.includes('close')) text = 'Close button';
+							else if (classes.includes('menu')) text = 'Menu button';
+							
+							// Check if it's inside a form or search container
+							const form = el.closest('form');
+							const searchContainer = el.closest('[class*="search"], [id*="search"]');
+							if (form || searchContainer) {
+								// Check if near a search input
+								const nearbyInput = el.parentElement?.querySelector('input[type="search"], input[name="search"], #searchInput');
+								if (nearbyInput) text = 'Search submit button';
+							}
+							
+							// Check for SVG icons
+							const svg = el.querySelector('svg');
+							if (svg) {
+								const svgTitle = svg.querySelector('title');
+								if (svgTitle) text = svgTitle.textContent;
+								else text = 'Icon button';
+							}
+						}
+						
+						return text.trim().substring(0, 200);
+					};
+					
+					// Helper to get element context
+					const getElementContext = (el) => {
+						const context = {};
+						
+						// Get form context
+						const form = el.closest('form');
+						if (form) {
+							context.inForm = true;
+							context.formId = form.id || null;
+							context.formName = form.name || null;
+						}
+						
+						// Get semantic container
+						const article = el.closest('article');
+						const nav = el.closest('nav');
+						const header = el.closest('header');
+						const footer = el.closest('footer');
+						const main = el.closest('main');
+						
+						if (article) context.inArticle = true;
+						if (nav) context.inNav = true;
+						if (header) context.inHeader = true;
+						if (footer) context.inFooter = true;
+						if (main) context.inMain = true;
+						
+						// Get nearby elements for context
+						const parent = el.parentElement;
+						if (parent) {
+							const siblings = Array.from(parent.children);
+							const index = siblings.indexOf(el);
+							
+							// Check previous sibling
+							if (index > 0) {
+								const prev = siblings[index - 1];
+								if (prev.tagName === 'LABEL') context.precededByLabel = prev.textContent;
+								if (prev.tagName === 'INPUT') context.precededByInput = prev.type;
+							}
+							
+							// Check next sibling
+							if (index < siblings.length - 1) {
+								const next = siblings[index + 1];
+								if (next.tagName === 'BUTTON') context.followedByButton = true;
+								if (next.tagName === 'INPUT') context.followedByInput = next.type;
+							}
+						}
+						
+						return context;
+					};
+					
+					// Process each selector
+					for (const selector of interactiveSelectors) {
+						try {
+							const found = document.querySelectorAll(selector);
+							for (const el of found) {
+								if (seen.has(el)) continue;
+								seen.add(el);
+								
+								// Skip invisible elements
+								const rect = el.getBoundingClientRect();
+								const style = window.getComputedStyle(el);
+								const isVisible = rect.width > 0 && rect.height > 0 && 
+									style.display !== 'none' && style.visibility !== 'hidden' &&
+									style.opacity !== '0';
+								
+								if (!isVisible) continue;
+								
+								const info = {
+									tag: el.tagName.toLowerCase(),
+									text: getElementText(el),
+									attributes: {},
+									rect: {
+										x: rect.x,
+										y: rect.y,
+										width: rect.width,
+										height: rect.height
+									},
+									isVisible: true,
+									context: getElementContext(el),
+									// Additional properties for better matching
+									type: el.type || el.getAttribute('type') || '',
+									role: el.getAttribute('role') || '',
+									placeholder: el.placeholder || '',
+									name: el.name || '',
+									id: el.id || '',
+									className: el.className || '',
+									ariaLabel: el.getAttribute('aria-label') || '',
+									isInput: el.tagName === 'INPUT' || el.tagName === 'TEXTAREA',
+									isButton: el.tagName === 'BUTTON' || el.type === 'submit' || el.type === 'button' || el.getAttribute('role') === 'button',
+									isSearchInput: el.type === 'search' || el.name?.includes('search') || el.id?.includes('search') || el.className?.includes('search')
+								};
+								
+								// Get all attributes
+								for (const attr of el.attributes) {
+									info.attributes[attr.name] = attr.value;
+								}
+								
+								elements.push(info);
+								
+								if (elements.length >= maxElements) {
+									return elements;
+								}
+							}
+						} catch (e) {
+							console.error('Error with selector:', selector, e);
+						}
+					}
+					
+					return elements;
+				}""")
+					
+					perception_data['page_elements'] = elements
+					logger.debug(f"Extracted {len(elements)} elements from page")
+					
+					# Cache the elements
+					await page_elements_cache.set(current_url, elements)
+					
+				except Exception as e:
+					logger.error(f"Failed to extract page elements: {e}")
+					perception_data['page_elements'] = []
+		
+		# Log available strategies
+		logger.info(f"Trying {len(self.strategies)} resolution strategies for: {intent.description}")
+		for i, strategy in enumerate(self.strategies):
+			logger.debug(f"  Strategy {i+1}: {strategy.__class__.__name__}")
+		
 		# Try each strategy
 		for strategy in self.strategies:
 			try:
-				logger.debug(f"Trying strategy: {strategy.__class__.__name__}")
+				logger.info(f"Trying strategy: {strategy.__class__.__name__}")
 				element = await strategy.resolve(intent, perception_data, page)
 				if element:
-					logger.debug(f"Found element with {strategy.__class__.__name__}: selector={element.selector}")
+					logger.info(f"✓ Found element with {strategy.__class__.__name__}: selector={element.selector}")
 					# Return a ResolvedElement
 					return ResolvedElement(
 						element=element,
@@ -139,9 +352,9 @@ class MultiStrategyElementResolver:
 						resolution_time_ms=0
 					)
 				else:
-					logger.debug(f"No element found with {strategy.__class__.__name__}")
+					logger.info(f"✗ No element found with {strategy.__class__.__name__}")
 			except Exception as e:
-				logger.debug(f"Strategy {strategy.__class__.__name__} failed: {e}")
+				logger.warning(f"Strategy {strategy.__class__.__name__} failed: {e}")
 				# Log but continue with other strategies
 				pass
 		

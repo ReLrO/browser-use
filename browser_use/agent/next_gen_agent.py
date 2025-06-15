@@ -164,6 +164,15 @@ class NextGenBrowserAgent:
 		self._execution_context = clean_context
 		self._execution_context["start_time"] = datetime.now().isoformat()
 		
+		# Track task history for context-dependent references
+		if not hasattr(self, '_task_history'):
+			self._task_history = []
+		
+		# Add current task to context for analysis
+		self._execution_context["current_task"] = task
+		if self._task_history:
+			self._execution_context["previous_task"] = self._task_history[-1]
+		
 		try:
 			# Analyze task into intent
 			analysis_result = await self.intent_analyzer.analyze(task, self._execution_context)
@@ -180,9 +189,8 @@ class NextGenBrowserAgent:
 			
 			# Get current perception data
 			perception_data = await self._get_perception_data()
-			# Make a copy without the page object for context
-			clean_perception_data = {k: v for k, v in perception_data.items() if k != "page"}
-			self._execution_context["perception_data"] = clean_perception_data
+			# Pass the full perception data including page_elements
+			self._execution_context["perception_data"] = perception_data
 			# Keep page in execution context separately
 			self._execution_context["page"] = self.current_page
 			
@@ -201,7 +209,7 @@ class NextGenBrowserAgent:
 			)
 			
 			# Build response
-			return {
+			result = {
 				"success": execution_result.success,
 				"intent_id": intent.id,
 				"actions_taken": len(execution_result.actions_taken),
@@ -214,6 +222,21 @@ class NextGenBrowserAgent:
 				"errors": execution_result.errors,
 				"data": getattr(execution_result, 'extracted_data', {})
 			}
+			
+			# Update task history
+			self._task_history.append({
+				"task": task,
+				"success": execution_result.success,
+				"intent_type": intent.type.value if intent.type else "unknown",
+				"primary_goal": intent.primary_goal,
+				"timestamp": datetime.now().isoformat()
+			})
+			
+			# Keep only last 10 tasks in history
+			if len(self._task_history) > 10:
+				self._task_history = self._task_history[-10:]
+			
+			return result
 			
 		except Exception as e:
 			import logging

@@ -70,6 +70,10 @@ class IntentAnalyzer:
 		]
 		
 		try:
+			# Apply rate limiting
+			from browser_use.core.caching import rate_limiter
+			await rate_limiter.acquire()
+			
 			response = await self.llm.ainvoke(messages)
 			
 			# Debug logging
@@ -104,12 +108,20 @@ class IntentAnalyzer:
 		"""Build the system prompt for intent analysis"""
 		return """You are an expert at understanding user intents for browser automation tasks.
 
+CRITICAL: Understand CONTEXT. When the user says "enter it" or "click it" or "read it", they are referring to something from the previous context or current page state.
+
 Analyze the user's task and decompose it into a structured intent with:
 1. Primary goal - what the user ultimately wants to achieve
 2. Sub-intents - smaller tasks that need to be completed
 3. Parameters - specific values needed for execution
 4. Constraints - limitations or requirements
 5. Success criteria - how to verify the task was completed
+
+Context-dependent interpretation:
+- "enter it and read it" usually means: click on a link/article from previous results and read its content
+- "it" refers to the most recent element discussed or found
+- "filter by X" means finding and using filter controls on the current page
+- "sort by Y" means finding and using sort controls on the current page
 
 Respond with a JSON object following this structure:
 {
@@ -143,20 +155,49 @@ Be specific and actionable in your analysis.
 Intent type guidance:
 - navigation: Going to URLs or pages
 - form_fill: Typing text into input fields, textareas, or filling forms
-- interaction: Clicking buttons, links, checkboxes, radio buttons
+- interaction: Clicking buttons, links, checkboxes, radio buttons, or any clickable element
 - search: Finding elements or information on a page
 - extraction: Getting data from the page
 - authentication: Login/logout operations
 - verification: Checking page state or content
+- composite: Multiple related actions
 
-For typing tasks, use 'form_fill' type with the text to type in parameters."""
+For context-dependent tasks:
+- If the user says "enter it", this likely means clicking on something mentioned previously
+- If they say "read it", add an extraction sub-intent after the interaction
+- Always consider what "it" refers to from the context"""
 	
 	def _build_user_prompt(self, task: str, context: Optional[dict], quick_match: Optional[dict]) -> str:
 		"""Build the user prompt with task and context"""
 		prompt = f"Task: {task}\n\n"
 		
 		if context:
-			prompt += f"Context:\n{json.dumps(context, indent=2)}\n\n"
+			# Include relevant context for understanding "it" and other references
+			context_summary = {}
+			
+			# Previous task results
+			if 'previous_task' in context:
+				context_summary['previous_task'] = context['previous_task']
+			if 'last_search_query' in context:
+				context_summary['last_search'] = context['last_search_query']
+			if 'current_page_type' in context:
+				context_summary['page_type'] = context['current_page_type']
+			if 'available_elements' in context:
+				context_summary['visible_elements'] = context['available_elements'][:5]  # First 5 elements
+			
+			# Current page state
+			if 'perception_data' in context and isinstance(context['perception_data'], dict):
+				if 'url' in context['perception_data']:
+					context_summary['current_url'] = context['perception_data']['url']
+				if 'page_elements' in context['perception_data']:
+					# Include summary of page elements
+					elements = context['perception_data']['page_elements']
+					if elements:
+						context_summary['element_count'] = len(elements)
+						context_summary['element_types'] = list(set(e.get('tag', 'unknown') for e in elements[:20]))
+			
+			prompt += f"Context:\n{json.dumps(context_summary, indent=2)}\n\n"
+			prompt += "Note: When user says 'it', they're likely referring to something from the previous task or current page.\n\n"
 		
 		if quick_match:
 			prompt += f"Initial classification: {quick_match['type']}\n"

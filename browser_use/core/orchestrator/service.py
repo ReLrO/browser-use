@@ -195,10 +195,11 @@ class ParallelActionOrchestrator:
 		plan = ExecutionPlan()
 		
 		# Convert sub-intents to actions
-		for sub_intent in intent.sub_intents:
+		prev_action_id = None
+		for i, sub_intent in enumerate(intent.sub_intents):
 			actions = await self._sub_intent_to_actions(sub_intent)
 			
-			for action in actions:
+			for j, action in enumerate(actions):
 				# Map sub-intent dependencies to action dependencies
 				if sub_intent.dependencies:
 					# Find last action of each dependency
@@ -208,7 +209,13 @@ class ParallelActionOrchestrator:
 							last_dep_action = dep_actions[-1]
 							action.dependencies.add(last_dep_action.id)
 				
+				# CRITICAL FIX: Ensure actions execute in order
+				# If this is not the first action, make it depend on the previous one
+				if prev_action_id and not action.dependencies:
+					action.dependencies.add(prev_action_id)
+				
 				plan.add_action(action)
+				prev_action_id = action.id
 		
 		return plan
 	
@@ -246,13 +253,46 @@ class ParallelActionOrchestrator:
 		elif sub_intent.type == IntentType.INTERACTION:
 			# Find target element
 			element_desc = self._get_parameter_value(sub_intent, "element") or sub_intent.description
-			element_intent = ElementIntent(description=element_desc)
 			
 			logger.debug(f"INTERACTION sub-intent: desc='{sub_intent.description}'")
 			logger.debug(f"Parameters: {[(p.name, p.value) for p in sub_intent.parameters]}")
 			
+			# Check for keyboard actions
+			desc_lower = sub_intent.description.lower()
+			if any(phrase in desc_lower for phrase in [
+				'press enter', 'hit enter', 'press return', 'hit return',
+				'submit the search', 'submit search', 'press the enter key',
+				'submit query', 'submit the query'
+			]):
+				# This is a keyboard action
+				logger.debug("Detected keyboard action: Enter key")
+				actions.append(Action(
+					id=f"{sub_intent.id}_keyboard",
+					type=ActionType.KEYBOARD,
+					parameters={"key": "Enter"}
+				))
+				return actions  # Don't try to find an element
+			
+			# Special handling for "located" elements - means we should look for it
+			if 'located' in desc_lower and 'first' in desc_lower and 'result' in desc_lower:
+				# This is asking to click on the first search result
+				element_desc = "Click on the first search result link"
+			elif 'press' in desc_lower and 'key' in desc_lower:
+				# Generic keyboard action
+				# Try to extract key name
+				import re
+				key_match = re.search(r'press\s+(\w+)\s+key', desc_lower)
+				if key_match:
+					key = key_match.group(1).capitalize()
+					actions.append(Action(
+						id=f"{sub_intent.id}_keyboard",
+						type=ActionType.KEYBOARD,
+						parameters={"key": key}
+					))
+					return actions  # Don't try to find an element
 			# Check if this is a typing interaction
-			if any(keyword in sub_intent.description.lower() for keyword in ['type', 'enter', 'input', 'fill', 'write']):
+			elif any(keyword in desc_lower for keyword in ['type', 'enter text', 'input', 'fill', 'write']):
+				element_intent = ElementIntent(description=element_desc)
 				# Get text value from parameters or description
 				text_value = self._get_parameter_value(sub_intent, "text")
 				if not text_value:
@@ -281,10 +321,11 @@ class ParallelActionOrchestrator:
 					actions.append(Action(
 						id=f"{sub_intent.id}_click",
 						type=ActionType.CLICK,
-						parameters={"element_intent": element_intent}
+						parameters={"element_intent": ElementIntent(description=element_desc)}
 					))
 			else:
 				# Default to click action
+				element_intent = ElementIntent(description=element_desc)
 				actions.append(Action(
 					id=f"{sub_intent.id}_click",
 					type=ActionType.CLICK,
@@ -374,6 +415,14 @@ class ParallelActionOrchestrator:
 							"clear_first": True
 						}
 					))
+		
+		elif sub_intent.type == IntentType.SEARCH:
+			# Search intent - usually means finding an element on the page
+			# This is often misused by the LLM when it means to click something
+			logger.debug(f"SEARCH intent - interpreting as element identification for: {sub_intent.description}")
+			# Don't create any action - this is just identification
+			# The next sub-intent should handle the actual interaction
+			pass
 		
 		elif sub_intent.type == IntentType.EXTRACTION:
 			# Extract data action
@@ -506,6 +555,11 @@ class ParallelActionOrchestrator:
 							# Ensure page is in perception_data
 							if "page" not in perception_data and "page" in self._execution_context:
 								perception_data["page"] = self._execution_context["page"]
+							
+							# CRITICAL: Ensure we have page_elements for resolution
+							if 'page_elements' not in perception_data and "page" in self._execution_context:
+								logger.debug("No page_elements in perception_data, will be extracted by resolver")
+								# The resolver will extract them if needed
 							
 							# Ensure perception_data is JSON-serializable (some strategies might serialize it)
 							# Create a copy without non-serializable objects

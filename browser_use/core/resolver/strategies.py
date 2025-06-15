@@ -8,6 +8,7 @@ from browser_use.perception.base import PerceptionElement, PerceptionQuery
 from browser_use.perception.dom.simple_element_finder import SimpleElementFinder
 from browser_use.core.intent.views import ElementIntent
 from browser_use.core.resolver.llm_element_finder import LLMElementFinder
+from browser_use.core.ui_understanding import SmartElementMatcher
 from playwright.async_api import Page
 import logging
 
@@ -101,9 +102,13 @@ class LLMFinderStrategy(ResolutionStrategy):
         
         logger.debug(f"LLMFinderStrategy resolving: {element_intent.description}")
         
+        # Pass page_elements from perception_data if available
+        page_elements = perception_data.get('page_elements')
+        
         element = await self.llm_finder.find_element(
             page=page,
-            element_intent=element_intent
+            element_intent=element_intent,
+            page_elements=page_elements
         )
         
         if element:
@@ -112,3 +117,68 @@ class LLMFinderStrategy(ResolutionStrategy):
             logger.debug("LLM could not find element")
             
         return element
+
+
+class SmartUIStrategy(ResolutionStrategy):
+    """Strategy using smart UI understanding"""
+    
+    def __init__(self, llm):
+        self.smart_matcher = SmartElementMatcher(llm)
+    
+    async def resolve(
+        self,
+        element_intent: ElementIntent,
+        perception_data: Dict[str, Any],
+        page: Page
+    ) -> Optional[PerceptionElement]:
+        """Resolve using smart UI pattern matching"""
+        
+        logger.debug(f"SmartUIStrategy resolving: {element_intent.description}")
+        
+        try:
+            # Use smart matching
+            match = await self.smart_matcher.find_element_smart(
+                page=page,
+                description=element_intent.description
+            )
+            
+            if match:
+                logger.info(f"Smart UI found element: {match['selector']} (confidence: {match['confidence']})")
+                logger.debug(f"Reasoning: {match['reasoning']}")
+                
+                # Get element handle to verify
+                element_handle = await page.query_selector(match['selector'])
+                if element_handle:
+                    # Get bounding box
+                    box = await element_handle.bounding_box()
+                    bounding_box = None
+                    if box:
+                        from browser_use.perception.base import BoundingBox
+                        bounding_box = BoundingBox(
+                            x=box['x'],
+                            y=box['y'],
+                            width=box['width'],
+                            height=box['height']
+                        )
+                    
+                    # Create PerceptionElement
+                    element_data = match['element_data']
+                    return PerceptionElement(
+                        type=element_data.get('role', 'unknown'),
+                        text=element_data.get('text', ''),
+                        selector=match['selector'],
+                        attributes=element_data.get('attributes', {}),
+                        bounding_box=bounding_box,
+                        confidence=match['confidence'],
+                        is_interactive=True,
+                        is_visible=True
+                    )
+                else:
+                    logger.warning(f"Element not found with selector: {match['selector']}")
+            else:
+                logger.debug("Smart UI could not find element")
+                
+        except Exception as e:
+            logger.error(f"Smart UI strategy error: {e}")
+            
+        return None
